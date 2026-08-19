@@ -1,0 +1,51 @@
+{
+  "name": "cadence",
+  "private": true,
+  "version": "0.1.0",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "description": "Typing-driven classical piano. Your rhythm, Chopin's notes.",
+  "scripts": {
+    "midi": "node scripts/build-midi.mjs",
+    "dev": "npm run midi && vite",
+    "build": "npm run midi && vite build",
+    "build:release": "node scripts/build-midi.mjs --no-local && vite build",
+    "preview": "vite preview",
+    "desktop": "npm run build && electron .",
+    "package:win": "npm run build:release && electron-builder --win portable && node scripts/prepare-release.mjs"
+  },
+  "dependencies": {
+    "@tonejs/midi": "^2.0.28",
+    "idb-keyval": "^6.2.1",
+    "smplr": "^0.16.1",
+    "tone": "^15.0.4",
+    "uiohook-napi": "1.5.5"
+  },
+  "devDependencies": {
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3",
+    "vite": "^7.0.0"
+  },
+  "build": {
+    "appId": "com.cadence.desktop",
+    "productName": "Cadence",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/uiohook-napi/**/*"
+    ],
+    "npmRebuild": false,
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "portable",
+      "artifactName": "Cadence-${version}-Windows.${ext}"
+    }
+  }
+}

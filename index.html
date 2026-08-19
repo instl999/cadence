@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b0d0c" />
+  <title>Cadence — 让输入成为音乐</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='9' fill='%23e7bd4f'/><path d='M11 9v12.5a3.5 3.5 0 1 0 2 3.15V13l9-2v8.5a3.5 3.5 0 1 0 2 3.15V7z' fill='%2310110f'/></svg>" />
+</head>
+<body>
+  <div id="app" data-enabled="false" data-playing="false">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true"><span>♪</span></div>
+      <div class="brand-copy">
+        <h1>Cadence</h1>
+        <p id="platformLabel">键盘伴奏</p>
+      </div>
+      <div class="privacy-chip" title="只处理按键时机，不读取或保存输入内容">
+        <span class="lock" aria-hidden="true"></span>
+        本地
+      </div>
+    </header>
+
+    <main>
+      <section class="activation-card" aria-labelledby="powerHeadline">
+        <div class="activation-copy">
+          <div class="eyebrow"><i id="liveDot"></i><span id="powerState">未启用</span></div>
+          <h2 id="powerHeadline">让键盘接管音乐</h2>
+          <p id="powerHint">启用后，切到任意应用直接输入</p>
+        </div>
+        <button id="power" class="power" type="button" aria-pressed="false">
+          <span class="power-symbol" aria-hidden="true"></span>
+          <span id="powerLabel">启用</span>
+        </button>
+        <div class="flow-guide" aria-label="使用步骤">
+          <div class="flow-step active"><b>1</b><span>启用</span></div>
+          <i></i>
+          <div class="flow-step"><b>2</b><span>切换窗口</span></div>
+          <i></i>
+          <div class="flow-step"><b>3</b><span>开始输入</span></div>
+        </div>
+      </section>
+
+      <section class="player-card" aria-labelledby="npTitle">
+        <div class="section-head">
+          <span>正在播放</span>
+          <b id="sourceTag">待机</b>
+        </div>
+
+        <div class="track-row">
+          <div class="cover" aria-hidden="true"><span>♪</span><i></i></div>
+          <div class="track-copy">
+            <h2 id="npTitle">准备音乐</h2>
+            <p id="npComposer">启用后自动播放第一首</p>
+          </div>
+        </div>
+
+        <div class="bars" id="bars" aria-hidden="true"></div>
+
+        <div class="timeline">
+          <div class="track"><i id="trackProgress"></i></div>
+          <div class="times"><span id="trackTime">0:00</span><span id="trackDuration">0:00</span></div>
+        </div>
+
+        <div class="transport" aria-label="播放控制">
+          <button id="order" class="transport-btn order-btn" type="button" aria-label="当前为顺序播放" title="顺序播放">
+            <span class="order-icon" aria-hidden="true">⇥</span>
+            <small id="orderLabel">顺序</small>
+          </button>
+          <button id="playPause" class="transport-btn play-btn" type="button" aria-label="播放" title="播放">
+            <span id="playIcon" aria-hidden="true">▶</span>
+          </button>
+          <button id="next" class="transport-btn" type="button" aria-label="下一首" title="下一首">
+            <span aria-hidden="true">▶│</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="pulse-card" aria-label="输入节奏">
+        <div class="pulse-orb" id="pulseOrb" aria-hidden="true"><i></i><span>⌨</span></div>
+        <div class="pulse-copy">
+          <span>输入节奏</span>
+          <strong><b id="stRate">0.0</b><small>键 / 秒</small></strong>
+        </div>
+        <div class="pulse-scope" id="pulseScope" aria-hidden="true"></div>
+      </section>
+
+      <section class="library-card" aria-labelledby="libraryTitle">
+        <div class="section-head library-head">
+          <span id="libraryTitle">播放列表</span>
+          <div class="library-actions">
+            <div class="help-wrap">
+              <button id="importHelpButton" class="help-button" type="button"
+                aria-label="查看音乐文件夹要求和 UVR 处理说明"
+                aria-describedby="importHelp" aria-expanded="false">?</button>
+              <aside id="importHelp" class="import-help" role="tooltip">
+                <div class="help-title"><span>♪</span><div><b>导入音乐资源</b><small>桌面版会自动扫描根目录</small></div></div>
+                <div class="help-import">
+                  <div><span>1</span><p>点右侧 <b>音乐资源</b> 打开固定目录</p></div>
+                  <div><span>2</span><p>每首歌新建一个“歌名”文件夹</p></div>
+                </div>
+                <div class="help-tree" aria-label="音乐资源目录结构">
+                  <code><b>音乐资源/</b></code>
+                  <code>└─ 示例歌曲/</code>
+                  <code>&nbsp;&nbsp;&nbsp;├─ 示例歌曲_(Vocals).wav</code>
+                  <code>&nbsp;&nbsp;&nbsp;└─ 示例歌曲_(Instrumental).wav</code>
+                </div>
+                <div class="help-format">
+                  <span>支持格式</span><b>MP3 · WAV · M4A · FLAC · OGG</b>
+                </div>
+                <div class="help-uvr">
+                  <div class="help-subtitle"><i>U</i><b>Ultimate Vocal Remover</b></div>
+                  <ol>
+                    <li><span>1</span><p><b>Select Input</b> 选 MP3，<b>Select Output</b> 选音乐文件夹</p></li>
+                    <li><span>2</span><p><b>Process Method</b> 选 MDX-Net，模型选 <b>UVR-MDX-NET Inst HQ 3</b></p></li>
+                    <li><span>3</span><p>格式选 <b>WAV</b>，不要勾 Vocals Only / Instrumental Only，点 <b>Start Processing</b></p></li>
+                  </ol>
+                </div>
+                <p class="help-foot"><i></i>放入文件后播放列表会自动刷新并配对分轨</p>
+              </aside>
+            </div>
+            <button id="pickDir" class="import-button" type="button" title="打开音乐资源文件夹" aria-label="打开音乐资源文件夹">
+              <span class="folder-icon" aria-hidden="true"></span><b id="resourceButtonLabel">音乐资源</b>
+            </button>
+          </div>
+        </div>
+        <ul id="list"></ul>
+        <div id="emptyLibrary" class="empty-library" hidden>
+          <span>＋</span><p>拖入音乐文件</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="privacy-note">
+        <span class="shield" aria-hidden="true">✓</span>
+        <p><b>只听节奏，不看内容</b><small>具体按键不会进入音乐引擎</small></p>
+      </div>
+    </footer>
+  </div>
+
+  <input id="folderInput" type="file" webkitdirectory multiple
+    accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.opus,.flac,.webm,.mid,.midi" hidden />
+  <div id="dropzone"><span>＋</span><b>松手导入音乐</b></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

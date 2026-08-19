@@ -1,0 +1,25 @@
+node_modules/
+dist/
+release/
+.claude/
+.codex/
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.p12
+*.pfx
+.DS_Store
+Thumbs.db
+# 用户自己的 MIDI（可能有版权），不进版本库、不参与分发
+local-midi/
+local-audio/
+local-stems/
+public/midi/local/
+public/midi/audio/
+public/midi/stems/
+# 固定资源目录中只提交空白示例，用户歌曲永不进入源码仓库
+音乐资源/*
+!音乐资源/歌曲名示例/
+!音乐资源/歌曲名示例/**
