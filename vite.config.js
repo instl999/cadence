@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  // Electron 通过 file:// 打开构建产物，所有资源都必须使用相对路径。
+  // Electron opens the build through file://, so every asset path must remain relative.
   base: './',
 });

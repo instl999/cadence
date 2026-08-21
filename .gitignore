@@ -12,14 +12,16 @@ release/
 *.pfx
 .DS_Store
 Thumbs.db
-# 用户自己的 MIDI（可能有版权），不进版本库、不参与分发
+# User-owned media may be copyrighted and must never enter source control or release builds.
 local-midi/
 local-audio/
 local-stems/
 public/midi/local/
 public/midi/audio/
 public/midi/stems/
-# 固定资源目录中只提交空白示例，用户歌曲永不进入源码仓库
-音乐资源/*
-!音乐资源/歌曲名示例/
-!音乐资源/歌曲名示例/**
+# Ignore legacy top-level folders whose names begin with a non-ASCII character.
+/[!A-Za-z0-9._-]*/
+# Commit only the blank English example under the fixed resource directory.
+Music Resources/*
+!Music Resources/Sample Song/
+!Music Resources/Sample Song/**

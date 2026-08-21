@@ -1,23 +1,22 @@
 import { pentatonicPool } from './keydetect.js';
 
 /**
- * 演奏层：把击键变成「你在弹这首歌」。
+ * Performance layer that turns key presses into playing the current song.
  *
- * 两种音源，优先用第一种：
- *  A. 配套 MIDI —— 抽出旋律线，击键按播放头顺序释放**原曲真正的音符**。
- *     这是「我在弹这首歌」而不是「我在随便按」的关键。
- *  B. 只有 MP3 —— 从音频估调性，用五声音阶音池。
- *     五声音阶在调内几乎不与任何和弦冲突，所以怎么按都不会难听。
+ * Two note sources are supported, in priority order:
+ * A. Matching MIDI: extract its melody and release the song's actual notes near
+ *    the playhead.
+ * B. Audio only: estimate the key and use an in-key pentatonic pool.
  *
- * 同步策略：击键释放的是「播放头附近该响的那个音」，不是「下一个没弹过的音」。
- * 后者会让打字快的人跑到伴奏前面去，几秒就散架。
+ * Selecting notes near the playhead prevents fast typing from outrunning the
+ * backing track.
  */
 export class Soloist {
   constructor(piano) {
     this.piano = piano;
     this.source = 'none';        // 'midi' | 'pentatonic' | 'none'
-    this.line = [];              // MIDI 模式：按时间排序的旋律音
-    this.pool = [];              // 五声模式：可用音高
+    this.line = [];              // Time-sorted melody notes for MIDI mode.
+    this.pool = [];              // Available pitches for pentatonic mode.
     this.octave = 0;
     this._last = 0;
     this._lastIdx = -1;
@@ -29,13 +28,13 @@ export class Soloist {
     this.minGap = 0.045;
   }
 
-  /** 从已解析的乐谱抽旋律线。取显著度最高的一批 melody 层音符。 */
+  /** Extract the most salient melody-layer notes from a parsed score. */
   fromMidi(piece) {
     const mel = piece.notes
       .filter((n) => n.layer === 'melody' && n.midi >= 55 && n.midi <= 96)
       .sort((a, b) => a.time - b.time);
 
-    // 同一时刻只留最高音，避免和弦式旋律一次放出一堆
+    // Keep only the highest note at each onset to avoid chord bursts.
     const line = [];
     for (const n of mel) {
       const prev = line[line.length - 1];
@@ -43,9 +42,8 @@ export class Soloist {
         if (n.midi > prev.midi) line[line.length - 1] = n;
       } else line.push(n);
     }
-    // 限流到「能唱出来」的密度。
-    // 实录 MIDI 的 melody 层可能有 25 音/秒——那是整个上层织体，不是旋律。
-    // 用户按 5 键/秒等于在里面每 5 个取 1 个，听起来是散音不是曲调。
+    // Limit density to a singable rate. Recorded MIDI melody layers may include
+    // an entire upper texture rather than one perceivable melodic line.
     const TARGET_RATE = 3.5;
     const budget = Math.ceil(TARGET_RATE * (piece.duration || 1));
     if (line.length > budget) {
@@ -69,10 +67,10 @@ export class Soloist {
   }
 
   /**
-   * 一次击键。
-   * @param scorePos 当前播放头在乐谱时间轴上的位置（秒）
-   * @param intensity 打字强度 0..1，驱动力度
-   * @returns 实际弹出的音高，没弹则返回 null
+   * Process one key press.
+   * @param scorePos Current playhead position on the score timeline, in seconds.
+   * @param intensity Typing intensity from 0..1, used for velocity.
+   * @returns The played MIDI pitch, or null if no note was played.
    */
   strike(scorePos, intensity = 0.5) {
     const now = this.piano.immediate();
@@ -84,15 +82,13 @@ export class Soloist {
 
     if (this.source === 'midi' && this.line.length) {
       const i = this._nearestIdx(scorePos);
-      // 同一个音已经弹过就往后挪一个，避免连打时原地重复同一个音
+      // Advance when the same note was just played to avoid local repetition.
       const idx = (i === this._lastIdx) ? Math.min(this.line.length - 1, i + 1) : i;
       this._lastIdx = idx;
       midi = this.line[idx].midi + this.octave * 12;
-      // 八度归位：实录的 melody 层横跨三四个八度，直接照搬会出现 40 个半音的大跳。
-      // 保留音级（还是这首歌的音），只选一个八度位置，同时满足两件事：
-      //   1. 离上一个音近（旋律连贯）
-      //   2. 离中心音区近（否则会一路走高，卡死在最尖的那几个音上）
-      const CENTER = 74;   // D5，人声主旋律的舒适区
+      // Normalize octave placement. Keep the pitch class while balancing melodic
+      // continuity against proximity to a comfortable center register.
+      const CENTER = 74;   // D5, a comfortable melodic register.
       let bestM = midi, bestCost = Infinity;
       for (let k = -3; k <= 3; k++) {
         const cand = midi + k * 12;
@@ -104,7 +100,7 @@ export class Soloist {
       midi = bestM;
       this._lastMidi = midi;
     } else if (this.source === 'pentatonic' && this.pool.length) {
-      // 按打字强度做上下行的旋律走向，而不是纯随机跳
+      // Shape an ascending or descending contour instead of jumping randomly.
       this._poolIdx += this._dir * (Math.random() < 0.72 ? 1 : 2);
       if (this._poolIdx >= this.pool.length - 1) { this._poolIdx = this.pool.length - 1; this._dir = -1; }
       if (this._poolIdx <= 0) { this._poolIdx = 0; this._dir = 1; }
@@ -117,7 +113,7 @@ export class Soloist {
     return midi;
   }
 
-  /** 二分找最接近播放头的旋律音 */
+  /** Find the melody note nearest the playhead with binary search. */
   _nearestIdx(t) {
     const L = this.line;
     let lo = 0, hi = L.length - 1;

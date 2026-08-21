@@ -1,16 +1,16 @@
 Cadence Music Import Instructions
 
-1. Copy the “歌曲名示例” example folder and rename the copy to the real song title.
+1. Copy the "Sample Song" folder and rename the copy to the real song title.
 2. Put that song's files in the renamed folder. For the full typing-follow effect, use two synchronized stems from the same Ultimate Vocal Remover run:
 
    Song Name_(Vocals).wav
    Song Name_(Instrumental).wav
 
-3. Do not trim or time-stretch only one stem. Both files must share the same start and duration.
-4. Cadence refreshes the playlist automatically. You can also select “Music Resource” in the app to confirm the active directory.
+3. Do not trim or time-stretch only one stem. Both files must share the same start point and duration.
+4. Cadence refreshes the playlist automatically. You can also choose "Music Resources" in the app to confirm the active directory.
 
 WAV or a high-quality MP3 is recommended. M4A, AAC, FLAC, OGG, OPUS, WEBM, MID, and MIDI are also recognized.
 A single audio file can play normally, but the complete reveal effect requires both Vocal and Instrumental stems.
-Process and play only music you own or are authorized to use. This TXT file is not added to the playlist.
+Process and play only music you own or are authorized to use. This text file is not added to the playlist.
 
-Full English guide: docs/user-guide.en.md
+Full guide: docs/user-guide.en.md
