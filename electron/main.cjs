@@ -5,6 +5,8 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
+app.commandLine.appendSwitch('lang', 'en-US');
+
 protocol.registerSchemesAsPrivileged([{
   scheme: 'cadence-media',
   privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
@@ -28,52 +30,91 @@ let musicRefreshTimer = null;
 let mediaProtocolInstalled = false;
 const mediaFiles = new Map();
 
-const MUSIC_RESOURCE_NAME = '音乐资源';
+const MUSIC_RESOURCE_NAME = 'Music Resources';
+const LEGACY_MUSIC_RESOURCE_NAME = '\u97f3\u4e50\u8d44\u6e90';
 const MUSIC_FILE_RE = /\.(mp3|wav|m4a|aac|ogg|opus|flac|webm|mid|midi)$/i;
 const RESOURCE_GUIDES = [
   {
-    name: '将UVR分离文件放在这里.txt',
-    content: `Cadence 音乐导入说明
-
-1. 复制“歌曲名示例”文件夹，并把副本改成真实歌名。
-2. 放入同一次 Ultimate Vocal Remover 处理得到的同步分轨：
-
-   歌名_(Vocals).wav
-   歌名_(Instrumental).wav
-
-3. 不要只裁剪或变速其中一条。Cadence 会自动刷新播放列表。
-4. 推荐 WAV 或高质量 MP3；请只使用你拥有或获准处理的音乐。
-`,
-  },
-  {
-    name: 'Import Instructions-English.txt',
+    name: 'Import Instructions.txt',
     content: `Cadence Music Import Instructions
 
-1. Copy the example folder and rename it to the real song title.
-2. Add two synchronized stems from the same Ultimate Vocal Remover run:
+1. Copy the "Sample Song" folder and rename it to the real song title.
+2. Add synchronized stems from the same Ultimate Vocal Remover run:
 
    Song Name_(Vocals).wav
    Song Name_(Instrumental).wav
 
-3. Do not trim or time-stretch only one stem. Cadence refreshes automatically.
-4. WAV or high-quality MP3 is recommended. Use only music you are authorized to process.
+3. Do not trim or time-stretch only one stem. Both files must share the same start point and duration.
+4. Cadence refreshes automatically. WAV or high-quality MP3 is recommended.
+5. Use only music you own or are authorized to process.
 `,
   },
 ];
 
+function musicResourceParent() {
+  if (process.env.PORTABLE_EXECUTABLE_DIR) {
+    return path.resolve(process.env.PORTABLE_EXECUTABLE_DIR);
+  }
+  if (!app.isPackaged) return app.getAppPath();
+  return path.dirname(process.execPath);
+}
+
 function musicResourceRoot() {
   if (process.env.CADENCE_MUSIC_ROOT) return path.resolve(process.env.CADENCE_MUSIC_ROOT);
-  if (process.env.PORTABLE_EXECUTABLE_DIR) {
-    return path.join(process.env.PORTABLE_EXECUTABLE_DIR, MUSIC_RESOURCE_NAME);
+  return path.join(musicResourceParent(), MUSIC_RESOURCE_NAME);
+}
+
+async function migrateLegacyMusicResourceRoot(root) {
+  if (process.env.CADENCE_MUSIC_ROOT) return;
+  const legacyRoot = path.join(musicResourceParent(), LEGACY_MUSIC_RESOURCE_NAME);
+  try {
+    await fsp.access(legacyRoot);
+  } catch {
+    return;
   }
-  if (!app.isPackaged) return path.join(app.getAppPath(), MUSIC_RESOURCE_NAME);
-  return path.join(path.dirname(process.execPath), MUSIC_RESOURCE_NAME);
+
+  let rootExists = true;
+  try {
+    await fsp.access(root);
+  } catch {
+    rootExists = false;
+  }
+
+  if (!rootExists) {
+    try {
+      await fsp.rename(legacyRoot, root);
+      return;
+    } catch {
+      throw new Error(`Could not migrate the legacy music folder to "${MUSIC_RESOURCE_NAME}".`);
+    }
+  }
+
+  // Preserve every legacy file in an English-named backup before merging any
+  // non-conflicting songs into the active resource directory.
+  const backupBase = path.join(musicResourceParent(), 'Music Resources Legacy Backup');
+  let backupRoot = backupBase;
+  let suffix = 2;
+  while (true) {
+    try {
+      await fsp.access(backupRoot);
+      backupRoot = `${backupBase} ${suffix++}`;
+    } catch {
+      break;
+    }
+  }
+  try {
+    await fsp.rename(legacyRoot, backupRoot);
+    await fsp.cp(backupRoot, root, { recursive: true, force: false, errorOnExist: false });
+  } catch {
+    throw new Error(`Could not merge the legacy music folder. Its backup was preserved.`);
+  }
 }
 
 async function ensureMusicResourceRoot() {
   const root = musicResourceRoot();
+  await migrateLegacyMusicResourceRoot(root);
   await fsp.mkdir(root, { recursive: true });
-  const example = path.join(root, '歌曲名示例');
+  const example = path.join(root, 'Sample Song');
   await fsp.mkdir(example, { recursive: true });
   for (const guide of RESOURCE_GUIDES) {
     const guidePath = path.join(example, guide.name);
@@ -86,9 +127,9 @@ async function ensureMusicResourceRoot() {
   return root;
 }
 
-function mediaUrl(filePath) {
+function mediaUrl(filePath, into = mediaFiles) {
   const token = crypto.createHash('sha256').update(filePath).digest('hex').slice(0, 32);
-  mediaFiles.set(token, filePath);
+  into.set(token, filePath);
   return `cadence-media://file/${token}`;
 }
 
@@ -97,32 +138,54 @@ function isInsideMusicRoot(filePath) {
   return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
+/**
+ * Strict check for the protocol boundary, where the guarantee actually matters.
+ * Resolving links first stops a symlink placed inside Music Resources from
+ * reading through to anywhere else on disk.
+ */
+async function isServableMediaPath(filePath) {
+  try {
+    const [realFile, realRoot] = await Promise.all([
+      fsp.realpath(filePath),
+      fsp.realpath(musicResourceRoot()),
+    ]);
+    const relative = path.relative(realRoot, realFile);
+    return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+  } catch {
+    return false;
+  }
+}
+
 async function scanMusicResource() {
   const root = await ensureMusicResourceRoot();
-  const records = [];
   const folders = (await fsp.readdir(root, { withFileTypes: true }))
     .filter((entry) => entry.isDirectory())
-    .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+    .sort((a, b) => a.name.localeCompare(b.name, 'en'));
 
-  for (const folder of folders) {
+  // Read the song folders concurrently. The renderer needs only name, parent,
+  // and url, so no per-file stat is required at all.
+  const nextTokens = new Map();
+  const perFolder = await Promise.all(folders.map(async (folder) => {
     const songDir = path.join(root, folder.name);
     const entries = (await fsp.readdir(songDir, { withFileTypes: true }))
       .filter((entry) => entry.isFile() && MUSIC_FILE_RE.test(entry.name))
-      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
-    for (const entry of entries) {
-      const filePath = path.join(songDir, entry.name);
-      if (!isInsideMusicRoot(filePath)) continue;
-      const info = await fsp.stat(filePath);
-      records.push({
-        name: entry.name,
+      .sort((a, b) => a.name.localeCompare(b.name, 'en'));
+    return entries
+      .map((entry) => path.join(songDir, entry.name))
+      .filter(isInsideMusicRoot)
+      .map((filePath) => ({
+        name: path.basename(filePath),
         parent: `${folder.name}/`,
-        url: mediaUrl(filePath),
-        size: info.size,
-        lastModified: info.mtimeMs,
-      });
-    }
-  }
-  return { name: MUSIC_RESOURCE_NAME, files: records, songFolders: folders.length };
+        url: mediaUrl(filePath, nextTokens),
+      }));
+  }));
+
+  // Swap the token table in only on success, so a song removed from the folder
+  // stops being fetchable while a failed scan leaves the old set serving.
+  mediaFiles.clear();
+  for (const [token, filePath] of nextTokens) mediaFiles.set(token, filePath);
+
+  return { name: MUSIC_RESOURCE_NAME, files: perFolder.flat(), songFolders: folders.length };
 }
 
 async function safeScanMusicResource() {
@@ -139,10 +202,18 @@ function installMediaProtocol() {
     const url = new URL(request.url);
     const token = url.hostname === 'file' ? url.pathname.slice(1) : '';
     const filePath = mediaFiles.get(token);
-    if (!filePath || !isInsideMusicRoot(filePath)) {
+    if (!filePath || !isInsideMusicRoot(filePath) || !(await isServableMediaPath(filePath))) {
       return new Response('Not found', { status: 404 });
     }
-    const response = await net.fetch(pathToFileURL(filePath).toString());
+
+    // Forward Range so a media element can request the part it needs instead of
+    // pulling the whole file. Status and Content-Range are passed straight back,
+    // so a backend that ignores the header still behaves exactly as before.
+    const forwarded = new Headers();
+    const range = request.headers.get('range');
+    if (range) forwarded.set('range', range);
+
+    const response = await net.fetch(pathToFileURL(filePath).toString(), { headers: forwarded });
     const headers = new Headers(response.headers);
     headers.set('Access-Control-Allow-Origin', '*');
     return new Response(response.body, { status: response.status, headers });
@@ -209,7 +280,7 @@ function publishState(extra = {}) {
 }
 
 function startHook() {
-  if (!uIOhook) throw hookLoadError ?? new Error('全局键盘监听模块不可用');
+  if (!uIOhook) throw hookLoadError ?? new Error('The global keyboard monitoring module is unavailable');
   if (hookRunning) return;
   uIOhook.start();
   hookRunning = true;
@@ -241,16 +312,16 @@ if (uIOhook) {
     const kind = keyKind(event.keycode);
     if (!kind) return;
 
-    // 隐私边界：keycode、修饰键和原始事件停留在主进程。
-    // 渲染层只会收到音乐所需的四种结构类别。
+    // Privacy boundary: raw key codes, modifiers, and native events stay in the main process.
+    // The renderer receives only the four structural categories required by the music engine.
     mainWindow.webContents.send('cadence:key', { kind });
   });
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 440,
-    height: 760,
+    width: 452,
+    height: 828,
     minWidth: 390,
     minHeight: 640,
     backgroundColor: '#0b0d0c',
@@ -279,7 +350,15 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    const allowed = devUrl ? url.startsWith(devUrl) : url.startsWith('file:');
+    // Compare origins rather than string prefixes: "http://localhost:5173" is
+    // also a prefix of "http://localhost:51730.example.com".
+    let allowed = false;
+    try {
+      const target = new URL(url);
+      allowed = devUrl ? target.origin === new URL(devUrl).origin : target.protocol === 'file:';
+    } catch {
+      allowed = false;
+    }
     if (!allowed) event.preventDefault();
   });
   mainWindow.on('closed', () => { mainWindow = null; });

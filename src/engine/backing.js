@@ -1,9 +1,9 @@
 /**
- * 伴奏轨：播放原曲音频文件。
+ * Backing track for the original audio file.
  *
- * 位置用 AudioContext 时钟推算，不直接读 <audio>.currentTime——
- * 后者在部分浏览器里按帧更新，抖动几十毫秒。击键要挑「此刻该响的旋律音」，
- * 位置误差必须小于一个十六分音符。
+ * Position is derived from the AudioContext clock rather than reading
+ * <audio>.currentTime directly, which updates per frame in some browsers. The
+ * timing error must remain below a sixteenth note for responsive note selection.
  */
 export class Backing {
   constructor(ctx) {
@@ -14,26 +14,35 @@ export class Backing {
     this.gain.connect(ctx.destination);
     this.duckGain = 1;
     this.volume = 0.75;
-    this._anchorCtx = 0;   // 起播时的 ctx.currentTime
-    this._anchorPos = 0;   // 起播时的曲内位置
+    this._anchorCtx = 0;   // Context time at playback start.
+    this._anchorPos = 0;   // Track position at playback start.
     this.playing = false;
-    this.offset = 0;       // MIDI 与音频的对齐偏移（秒），可为负
+    this.offset = 0;       // MIDI-to-audio offset in seconds; may be negative.
     this.duration = 0;
+    this._ownedUrl = null; // Object URL to revoke on unload, when we created it.
     this.onEnded = () => {};
   }
 
-  async load(url) {
+  /**
+   * @param url Media URL to play.
+   * @param revokeOnUnload Set when the URL is an object URL this deck owns.
+   */
+  async load(url, { revokeOnUnload = false } = {}) {
     this.stop();
+    this.unload();
     const el = new Audio();
     el.crossOrigin = 'anonymous';
     el.preload = 'auto';
     el.src = url;
     await new Promise((res, rej) => {
-      el.addEventListener('canplaythrough', res, { once: true });
-      el.addEventListener('error', () => rej(new Error('音频解码失败')), { once: true });
-      setTimeout(res, 8000); // 大文件慢，能播多少算多少
+      // Large files may become playable before they finish loading.
+      const timer = setTimeout(res, 8000);
+      const settle = (fn) => (value) => { clearTimeout(timer); fn(value); };
+      el.addEventListener('canplaythrough', settle(res), { once: true });
+      el.addEventListener('error', settle(() => rej(new Error('Audio decoding failed'))), { once: true });
     });
     this.el = el;
+    this._ownedUrl = revokeOnUnload ? url : null;
     el.addEventListener('ended', () => {
       this.playing = false;
       clearInterval(this._reanchor);
@@ -53,7 +62,7 @@ export class Backing {
     this._anchorCtx = this.ctx.currentTime;
     this._anchorPos = this.el.currentTime;
     this.playing = true;
-    // 定期用真实 currentTime 重锚，防止长时间累积漂移
+    // Re-anchor periodically to prevent long-running clock drift.
     clearInterval(this._reanchor);
     this._reanchor = setInterval(() => {
       if (!this.el || this.el.paused) return;
@@ -67,28 +76,46 @@ export class Backing {
     if (this.el) this.el.currentTime = 0;
   }
 
+  /**
+   * Release the current element and its source node.
+   *
+   * A MediaElementAudioSourceNode keeps a strong reference to its media element,
+   * and stays reachable while it remains connected to the graph. Overwriting
+   * this.src without disconnecting pins every element the instance ever loaded.
+   */
+  unload() {
+    clearInterval(this._reanchor);
+    if (this.src) { this.src.disconnect(); this.src = null; }
+    if (this._ownedUrl) { URL.revokeObjectURL(this._ownedUrl); this._ownedUrl = null; }
+    if (!this.el) return;
+    this.el.pause();
+    this.el.removeAttribute('src');
+    this.el.load();     // Drops the buffered media rather than leaving it resident.
+    this.el = null;
+    this.duration = 0;
+    this.playing = false;
+  }
+
   pause() {
     clearInterval(this._reanchor);
     if (this.el) this.el.pause();
     this.playing = false;
   }
 
-  /** 当前曲内位置（秒），由 AudioContext 时钟推算 */
+  /** Current track position in seconds, derived from the AudioContext clock. */
   get position() {
     if (!this.el || this.el.paused) return this.el?.currentTime ?? 0;
     return this._anchorPos + (this.ctx.currentTime - this._anchorCtx) * (this.el.playbackRate || 1);
   }
 
-  /** 对齐后的位置：用来在乐谱里找「此刻该响的音」 */
+  /** Aligned position used to select the score note for the current moment. */
   get scorePosition() { return this.position + this.offset; }
 
-  /** 用户演奏时把伴奏轻微压下去，让弹出来的音浮在上面 */
+  /** Duck the backing track slightly so performed notes stay prominent. */
   duck(amount) {
     this.duckGain = 1 - Math.min(0.45, Math.max(0, amount));
     this._applyGain();
   }
-
-  setVolume(v) { this.volume = v; this._applyGain(); }
 
   _applyGain() {
     const g = this.volume * this.duckGain;

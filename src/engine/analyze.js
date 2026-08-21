@@ -1,25 +1,25 @@
 import * as midiNS from '@tonejs/midi';
-// @tonejs/midi 是 CJS，Node 与 Vite 的互操作形态不同，两边都兜住
+// @tonejs/midi is CommonJS; support both Node and Vite interop shapes.
 const Midi = midiNS.Midi ?? midiNS.default?.Midi ?? midiNS.default;
 
 /**
- * 把任意 MIDI 文件解析成「带显著度的音符流」。
+ * Parse any MIDI file into a note stream with salience scores.
  *
- * 核心思路：不生成音符，只决定「哪些音符在当前密度下该响」。
- * 每个音符算一个 salience(0..1)，密度 d 表示「保留显著度最高的 d 比例音符」。
- * d=1 是原曲，d=0.3 只剩和声骨架——但因为外声部（低音+旋律）显著度最高，
- * 骨架听起来仍然是这首曲子，不会散架。
+ * The algorithm does not invent notes; it decides which existing notes should
+ * sound at the current density. Each note receives salience in the 0..1 range,
+ * and density d keeps the highest-ranked fraction. At d=0.3, the prominent
+ * bass and melody preserve the song's harmonic skeleton.
  *
- * 这个算法对任何钢琴 MIDI 都成立，所以用户丢进文件夹的曲子走同一条路。
+ * The same process works for any piano MIDI imported by the user.
  */
 
-const ONSET_WINDOW = 0.032; // 32ms 内视为同一次起音（实录的滚奏和弦音间隔常在 12~25ms）
-const GROUP_SPAN_MAX = 0.05; // 一组总跨度封顶，否则密集实录会把整串跑动黏成一坨
+const ONSET_WINDOW = 0.032; // Treat onsets within 32 ms as one group.
+const GROUP_SPAN_MAX = 0.05; // Prevent dense performances from merging long runs.
 
 /**
- * 从起音间隔估计速度。做法：取常见的短间隔作为候选「网格」，
- * 折算到 60~150 BPM 区间里，选支持度最高的一个。
- * 不求精确，只求让节拍权重有个大致正确的参照系。
+ * Estimate tempo from onset gaps. Map common short intervals into the 60-150
+ * BPM range and choose the best-supported candidate. Approximate timing is
+ * sufficient for metric weighting.
  */
 function estimateBpm(notes) {
   const onsets = [...new Set(notes.map((n) => +n.time.toFixed(3)))].sort((a, b) => a - b);
@@ -35,7 +35,7 @@ function estimateBpm(notes) {
     const beat = 60 / bpm;
     let score = 0;
     for (const g of gaps) {
-      // 间隔落在这个速度的 1/4、1/2、1、2 拍附近就算一票
+      // Count gaps near a quarter, half, one, or two beats at this tempo.
       for (const mult of [0.25, 0.5, 1, 2]) {
         const target = beat * mult;
         if (Math.abs(g - target) < target * 0.12) { score++; break; }
@@ -51,7 +51,7 @@ export function parseMidi(arrayBuffer, meta = {}) {
 
   const raw = [];
   for (const track of midi.tracks) {
-    if (track.channel === 9) continue; // 跳过鼓轨
+    if (track.channel === 9) continue; // Skip the percussion channel.
     for (const nt of track.notes) {
       raw.push({
         midi: nt.midi,
@@ -61,20 +61,20 @@ export function parseMidi(arrayBuffer, meta = {}) {
       });
     }
   }
-  if (!raw.length) throw new Error('这个 MIDI 文件里没有音符');
+  if (!raw.length) throw new Error('This MIDI file contains no notes');
   raw.sort((a, b) => a.time - b.time || a.midi - b.midi);
-  // 裁到钢琴音域，越界的音在采样器上会很难听
+  // Clamp notes to the piano range supported by the sampler.
   for (const nt of raw) nt.midi = Math.min(108, Math.max(21, nt.midi));
-  const medDur = [...raw.map((n) => n.dur)].sort((a, b) => a - b)[raw.length >> 1] || 0.2;
+  const medDur = raw.map((n) => n.dur).sort((a, b) => a - b)[raw.length >> 1] || 0.2;
 
   const hasTempo = midi.header.tempos.length > 0;
   const ts = midi.header.timeSignatures[0]?.timeSignature || [4, 4];
-  // 文件没写速度时，从起音间隔直方图估一个——否则节拍权重整条失效
+  // Estimate tempo when metadata is missing so metric weighting remains useful.
   const bpm = hasTempo ? midi.header.tempos[0].bpm : (meta.bpm || estimateBpm(raw));
   const beat = 60 / bpm;
   const barLen = beat * (ts[0] * (4 / ts[1]));
 
-  // —— 1. 按起音时刻分组 ——
+  // 1. Group notes by onset time.
   const groups = [];
   for (const nt of raw) {
     const last = groups[groups.length - 1];
@@ -83,22 +83,34 @@ export function parseMidi(arrayBuffer, meta = {}) {
     else groups.push({ time: nt.time, notes: [nt] });
   }
 
-  // —— 2. 建立「发声上下文」与「拍内天际线」——
-  // 关键点：琶音/分解和弦织体里，一次起音只有一个音，
-  // 光看同时起音的音会把整首曲子都判成低音线。必须看**此刻仍在响的所有音**。
+  // 2. Build sounding context and an in-beat pitch skyline.
+  // Arpeggios may contain only one onset at a time, so role detection must also
+  // consider notes that are still sounding.
   const active = [];
   for (const g of groups) {
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].time + active[i].dur <= g.time + 0.01) active.splice(i, 1);
     }
-    const sounding = [...active, ...g.notes];
-    g.lowSounding = Math.min(...sounding.map((n) => n.midi));
-    g.highSounding = Math.max(...sounding.map((n) => n.midi));
-    active.push(...g.notes);
+    // Scan for the extremes instead of spreading into Math.min/Math.max. Spread
+    // throws RangeError past roughly 125k arguments, which a dense orchestral
+    // score reaches, and it allocated two throwaway arrays per group besides.
+    let low = Infinity;
+    let high = -Infinity;
+    for (const nt of active) {
+      if (nt.midi < low) low = nt.midi;
+      if (nt.midi > high) high = nt.midi;
+    }
+    for (const nt of g.notes) {
+      if (nt.midi < low) low = nt.midi;
+      if (nt.midi > high) high = nt.midi;
+      active.push(nt);
+    }
+    g.lowSounding = low;
+    g.highSounding = high;
   }
 
-  // 拍内天际线：每一拍里起音的最高音是旋律骨架。
-  // 这让单声部的十六分跑动也能分出「骨架音」和「经过音」。
+  // The highest onset in each beat forms a melodic skyline, which separates
+  // structural notes from passing notes in single-voice runs.
   const winTop = new Map(), winLow = new Map();
   for (const nt of raw) {
     const w = Math.floor(nt.time / beat);
@@ -106,29 +118,36 @@ export function parseMidi(arrayBuffer, meta = {}) {
     winLow.set(w, Math.min(winLow.get(w) ?? 999, nt.midi));
   }
 
-  // —— 逐音符打分 ——
+  // Score each note.
   for (const g of groups) {
-    const sorted = [...g.notes].sort((a, b) => a.midi - b.midi);
-    const gHi = sorted[sorted.length - 1], gLo = sorted[0];
+    // Only the extremes are needed, so scan for them rather than sorting a copy
+    // of every group. On ties this keeps the same notes a stable sort would pick.
+    let gHi = g.notes[0];
+    let gLo = g.notes[0];
+    for (const nt of g.notes) {
+      if (nt.midi >= gHi.midi) gHi = nt;
+      if (nt.midi < gLo.midi) gLo = nt;
+    }
+    const polyphonic = g.notes.length > 1;
 
     for (const nt of g.notes) {
       const w = Math.floor(nt.time / beat);
-      // 低音线 = 既是此刻最低的发声音，也是这一拍里最低的起音。
-      // 少了后半个条件，左手琶音的每个音都会被误判成低音。
+      // A bass note must be both the lowest sounding pitch and the lowest onset
+      // in its beat; otherwise every note in a left-hand arpeggio looks like bass.
       const isBass = nt.midi <= g.lowSounding + 2 && nt.midi === winLow.get(w);
       const isTop = nt.midi === winTop.get(w);
 
-      // (a) 声部角色
+      // (a) Voice role.
       let role, layer;
       if (isBass) { role = 0.95; layer = 'bass'; }
       else if (isTop) { role = 1.0; layer = 'melody'; }
-      else if (sorted.length > 1 && nt === gHi) { role = 0.8; layer = 'melody'; }
-      else if (sorted.length > 1 && nt === gLo) { role = 0.7; layer = 'inner'; }
+      else if (polyphonic && nt === gHi) { role = 0.8; layer = 'melody'; }
+      else if (polyphonic && nt === gLo) { role = 0.7; layer = 'inner'; }
       else { role = 0.4; layer = 'inner'; }
-      // 长音承担和声，不管它在织体的哪一层都得留住
+      // Sustained notes carry harmony regardless of their texture layer.
       if (nt.dur >= beat * 1.5) role = Math.max(role, 0.85);
 
-      // (b) 节拍权重：小节头 > 正拍 > 八分 > 更细的分割
+      // (b) Metric weight: bar start, beat, eighth note, then finer divisions.
       const pos = nt.time % barLen;
       const inBeats = pos / beat;
       const frac = Math.abs(inBeats - Math.round(inBeats));
@@ -138,8 +157,8 @@ export function parseMidi(arrayBuffer, meta = {}) {
       else if (Math.abs(inBeats * 2 - Math.round(inBeats * 2)) < 0.06) metric = 0.5;
       else metric = 0.28;
 
-      // (c) 时值权重：相对本曲中位时值，而不是相对一拍。
-      // 实录演奏时值中位数可能只有 47ms，用绝对尺度会让所有音挤在同一档。
+      // (c) Duration relative to this song's median rather than one beat.
+      // Recorded performances can have very short median durations.
       const durW = Math.min(1, nt.dur / (medDur * 2.5)) * 0.7 + 0.3;
 
       nt.salience = 0.55 * role + 0.25 * metric + 0.2 * durW;
@@ -147,14 +166,12 @@ export function parseMidi(arrayBuffer, meta = {}) {
     }
   }
 
-  // —— 3. 百分位归一化 ——
-  // 这一步让「密度 0.4」在任何曲子上都表示同一件事：保留最重要的 40% 音符。
-  // 没有它，织体厚的曲子和单声部曲子对同一个 d 反应会完全不同。
+  // 3. Normalize by percentile so density 0.4 consistently means keeping the
+  // most important 40 percent of notes across sparse and dense arrangements.
   const bySal = [...raw].sort((a, b) => a.salience - b.salience);
   bySal.forEach((nt, i) => { nt.rank = i / (bySal.length - 1 || 1); });
 
-  // 每小节保底：把该小节最显著的那个音钉成 rank=1。
-  // 没有这一步，低密度下会出现整小节静音——听感上是「卡带」，比稀疏难受得多。
+  // Keep at least one top-ranked note per bar to avoid full-bar dropouts.
   const perBar = new Map();
   for (const nt of raw) {
     const b = Math.floor(nt.time / barLen);
@@ -163,7 +180,11 @@ export function parseMidi(arrayBuffer, meta = {}) {
   }
   for (const nt of perBar.values()) nt.rank = 1;
 
-  const duration = Math.max(...raw.map((n) => n.time + n.dur));
+  let duration = 0;
+  for (const nt of raw) {
+    const end = nt.time + nt.dur;
+    if (end > duration) duration = end;
+  }
 
   return {
     ...meta,
@@ -176,8 +197,8 @@ export function parseMidi(arrayBuffer, meta = {}) {
 }
 
 /**
- * 密度门控：d=1 全放，d 越小保留越少。
- * 保底规则——任何一个小节都不会被削成完全静音。
+ * Density gate: d=1 keeps everything; smaller values keep fewer notes.
+ * At least one note remains in every bar.
  */
 export function gate(piece, d) {
   const keep = piece.notes.filter((n) => n.rank >= 1 - d);

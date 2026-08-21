@@ -7,22 +7,56 @@ import { Player } from './engine/player.js';
 import { Library } from './library/library.js';
 import { Backing } from './engine/backing.js';
 import { Soloist } from './engine/soloist.js';
-import { detectKey } from './engine/keydetect.js';
+import { detectKeyAsync, toAnalysisSamples, ANALYSIS_RATE } from './engine/keydetect.js';
 import { StemDeck } from './engine/stemdeck.js';
-import { Mixer, modeAvailable } from './engine/gate.js';
+import { Mixer, MODES, ANCHOR_ROLE, availableModes } from './engine/gate.js';
 import { Touch } from './engine/touch.js';
 
 const $ = (id) => document.getElementById(id);
-const appEl = $('app');
+
+// Elements touched on every keystroke or every frame are resolved once. The
+// global hook can fire faster than a repeated getElementById is worth paying for.
+const el = {
+  app: $('app'),
+  power: $('power'),
+  powerLabel: $('powerLabel'),
+  powerHeadline: $('powerHeadline'),
+  powerHint: $('powerHint'),
+  playPause: $('playPause'),
+  playIcon: $('playIcon'),
+  next: $('next'),
+  order: $('order'),
+  orderLabel: $('orderLabel'),
+  npTitle: $('npTitle'),
+  npComposer: $('npComposer'),
+  sourceTag: $('sourceTag'),
+  trackProgress: $('trackProgress'),
+  trackTime: $('trackTime'),
+  trackDuration: $('trackDuration'),
+  stRate: $('stRate'),
+  pulseOrb: $('pulseOrb'),
+  pulseScope: $('pulseScope'),
+  bars: $('bars'),
+  mixer: $('mixer'),
+  mixerRows: $('mixerRows'),
+  statusText: $('statusText'),
+  list: $('list'),
+  emptyLibrary: $('emptyLibrary'),
+  toast: $('toast'),
+  dropzone: $('dropzone'),
+  platformLabel: $('platformLabel'),
+};
+
+const KEY_KINDS = new Set(['char', 'back', 'enter', 'space']);
 const desktop = window.cadenceDesktop ?? null;
 
 if (desktop?.isDesktop) document.body.classList.add('desktop');
-$('platformLabel').textContent = desktop?.isDesktop ? 'Windows 全局输入' : '当前窗口预览';
-$('resourceButtonLabel').textContent = desktop?.isDesktop ? '音乐资源' : '导入文件夹';
+el.platformLabel.textContent = desktop?.isDesktop ? 'Windows-wide input' : 'Current-window preview';
+$('resourceButtonLabel').textContent = desktop?.isDesktop ? 'Music Resources' : 'Import Folder';
 if (!desktop?.isDesktop) {
-  $('pickDir').title = '导入音乐文件夹';
-  $('pickDir').setAttribute('aria-label', '导入音乐文件夹');
-  $('importHelp').querySelector('.help-title small').textContent = '网页预览需手动选择目录';
+  $('pickDir').title = 'Import a music folder';
+  $('pickDir').setAttribute('aria-label', 'Import a music folder');
+  $('importHelp').querySelector('.help-title small').textContent = 'Choose a folder manually in browser preview';
 }
 
 const piano = new Piano();
@@ -47,34 +81,43 @@ let currentEngine = null;
 let queue = [];
 let stemStartOffset = 0;
 let orderMode = localStorage.getItem('cadence:order') === 'shuffle' ? 'shuffle' : 'sequence';
+let stemMode = MODES[localStorage.getItem('cadence:stemMode')] ? localStorage.getItem('cadence:stemMode') : 'vocal';
 let refRate = Number(localStorage.getItem('cadence:refRate')) || 3.2;
 let toastTimer = null;
+let unduckTimer = null;
 let lastRateTune = 0;
 let lastUiTick = 0;
-let foreground = 0;
+let lastSourceTag = '';
 let libraryReady = false;
 let pendingMusicResource = null;
+let powerTransition = false;
+let shuffleDeck = [];
 
-// —— 轻量可视反馈 ——
+// Lightweight visual feedback.
 const barEls = [];
 for (let i = 0; i < 24; i++) {
-  const el = document.createElement('i');
-  $('bars').appendChild(el);
-  barEls.push(el);
+  const bar = document.createElement('i');
+  el.bars.appendChild(bar);
+  barEls.push(bar);
 }
 
+// The scope is a ring: flex order decides where each bar sits, so a keystroke
+// reuses the oldest element instead of destroying and creating one.
 const scopeEls = [];
 for (let i = 0; i < 23; i++) {
-  const el = document.createElement('i');
-  $('pulseScope').appendChild(el);
-  scopeEls.push(el);
+  const bar = document.createElement('i');
+  bar.style.order = String(i);
+  el.pulseScope.appendChild(bar);
+  scopeEls.push(bar);
 }
+let scopeCursor = 0;
+let scopeOrder = scopeEls.length;
 
 function showToast(message) {
   clearTimeout(toastTimer);
-  $('toast').textContent = message;
-  $('toast').classList.add('show');
-  toastTimer = setTimeout(() => $('toast').classList.remove('show'), 2600);
+  el.toast.textContent = message;
+  el.toast.classList.add('show');
+  toastTimer = setTimeout(() => el.toast.classList.remove('show'), 2600);
 }
 
 function formatTime(seconds) {
@@ -83,25 +126,39 @@ function formatTime(seconds) {
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
 }
 
+function setSourceTag(text) {
+  if (text === lastSourceTag) return;
+  lastSourceTag = text;
+  el.sourceTag.textContent = text;
+}
+
+let orbAnimations = null;
+
 function animateInput(kind) {
-  const orb = $('pulseOrb');
-  orb.classList.remove('hit');
-  void orb.offsetWidth;
-  orb.classList.add('hit');
-  setTimeout(() => orb.classList.remove('hit'), 330);
+  // Restarting the keyframes through the animation API avoids the classic
+  // remove-class / read-offsetWidth / add-class trick, which forces a
+  // synchronous layout on every single key. The lookup itself flushes pending
+  // style, so it happens once and the objects are reused from then on.
+  if (!orbAnimations?.length) {
+    el.pulseOrb.classList.add('hit');
+    orbAnimations = el.pulseOrb.getAnimations({ subtree: true });
+  }
+  for (const animation of orbAnimations) {
+    animation.currentTime = 0;
+    animation.play();
+  }
 
   const weight = kind === 'enter' || kind === 'space' ? 1 : kind === 'back' ? 0.72 : 0.86;
-  scopeEls.shift().remove();
-  const fresh = document.createElement('i');
+  const fresh = scopeEls[scopeCursor];
+  scopeCursor = (scopeCursor + 1) % scopeEls.length;
+  fresh.style.order = String(scopeOrder++);
   fresh.style.height = `${8 + weight * 36}px`;
   fresh.style.opacity = String(0.45 + weight * 0.45);
-  $('pulseScope').appendChild(fresh);
-  scopeEls.push(fresh);
 
   const idx = (sensor.events.length * 7) % barEls.length;
   const bar = barEls[idx];
   bar.style.height = `${10 + weight * 20}px`;
-  bar.style.background = 'var(--accent)';
+  bar.style.background = 'var(--live)';
   bar.style.opacity = '1';
   clearTimeout(bar._reset);
   bar._reset = setTimeout(() => {
@@ -116,14 +173,14 @@ player.onNote = (note) => {
     Math.round(((note.midi - 24) / 66) * (barEls.length - 1))));
   const bar = barEls[idx];
   bar.style.height = `${7 + note.vel * 23}px`;
-  bar.style.background = 'var(--accent)';
+  bar.style.background = 'var(--live)';
   clearTimeout(bar._reset);
   bar._reset = setTimeout(() => { bar.style.height = '3px'; bar.style.background = ''; }, 250);
 };
 
-// —— 全局/窗口键盘输入统一进入这一条隐私边界 ——
+// Global and window-local keyboard events enter through the same privacy boundary.
 function handleKind(kind) {
-  if (!enabled || !['char', 'back', 'enter', 'space'].includes(kind)) return;
+  if (!enabled || !KEY_KINDS.has(kind)) return;
   sensor.push(kind);
   animateInput(kind);
 
@@ -134,18 +191,14 @@ function handleKind(kind) {
     return;
   }
   if (backing?.playing) {
-    let fired = false;
     if (soloist) {
       const midi = soloist.strike(backing.scorePosition, arranger.intensity);
       if (midi !== null) {
-        fired = true;
         player.onNote({ midi, vel: 0.72, layer: 'melody' });
+        backing.duck(0.25 + arranger.intensity * 0.25);
+        clearTimeout(unduckTimer);
+        unduckTimer = setTimeout(() => backing.duck(0), 600);
       }
-    }
-    if (fired) {
-      backing.duck(0.25 + arranger.intensity * 0.25);
-      clearTimeout(window.__cadenceUnduck);
-      window.__cadenceUnduck = setTimeout(() => backing.duck(0), 600);
     }
     return;
   }
@@ -168,40 +221,44 @@ if (desktop?.isDesktop) {
 }
 
 function updatePowerUi() {
-  appEl.dataset.enabled = String(enabled);
-  appEl.dataset.playing = String(isPlaying);
-  $('power').setAttribute('aria-pressed', String(enabled));
-  $('playIcon').textContent = isPlaying ? 'Ⅱ' : '▶';
-  $('playPause').setAttribute('aria-label', isPlaying ? '暂停' : '播放');
-  $('playPause').title = isPlaying ? '暂停' : '播放';
+  el.app.dataset.enabled = String(enabled);
+  el.app.dataset.playing = String(isPlaying);
+  el.power.setAttribute('aria-pressed', String(enabled));
+  el.playIcon.textContent = isPlaying ? 'Ⅱ' : '▶';
+  el.playPause.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+  el.playPause.title = isPlaying ? 'Pause' : 'Play';
 
   if (isLoading) {
-    $('powerState').textContent = enabled ? '已启用 · 正在准备' : '正在准备';
-    $('powerHeadline').textContent = current ? `载入 ${current.title}` : '正在准备音乐';
-    $('powerHint').textContent = '第一次解码会稍久一些';
+    el.statusText.textContent = 'Loading';
+    el.powerHeadline.textContent = current ? `Loading ${current.title}` : 'Preparing music';
+    el.powerHint.textContent = 'The first decode may take a moment';
     return;
   }
 
   if (enabled) {
-    $('powerState').textContent = '全局输入已启用';
-    $('powerHeadline').textContent = isPlaying ? '去任何地方打字' : '音乐已暂停';
-    $('powerHint').textContent = isPlaying ? 'Cadence 会在后台跟随你的节奏' : '键盘监听仍保持启用';
-    $('powerLabel').textContent = '停用';
+    // "Listening" rather than "Paused": pausing the music does not stop the
+    // keyboard hook, and that distinction is the app's central privacy promise.
+    el.statusText.textContent = isPlaying ? 'Live' : 'Listening';
+    el.powerHeadline.textContent = isPlaying ? 'Type anywhere' : 'Music paused';
+    el.powerHint.textContent = isPlaying
+      ? 'Cadence follows your rhythm in the background'
+      : 'Keyboard monitoring remains enabled';
+    el.powerLabel.textContent = 'Disable';
   } else {
-    $('powerState').textContent = '未启用';
-    $('powerHeadline').textContent = '让键盘接管音乐';
-    $('powerHint').textContent = desktop?.isDesktop
-      ? '启用后，切到任意应用直接输入'
-      : '网页预览仅响应当前页面的输入';
-    $('powerLabel').textContent = '启用';
+    el.statusText.textContent = 'Idle';
+    el.powerHeadline.textContent = 'Let your keyboard drive the music';
+    el.powerHint.textContent = desktop?.isDesktop
+      ? 'Enable, switch to any app, and start typing'
+      : 'Browser preview responds only to this page';
+    el.powerLabel.textContent = 'Enable';
   }
 }
 
 function setLoading(value) {
   isLoading = value;
-  $('power').disabled = value;
-  $('playPause').disabled = value;
-  $('next').disabled = value;
+  el.power.disabled = value;
+  el.playPause.disabled = value;
+  el.next.disabled = value;
   updatePowerUi();
 }
 
@@ -223,9 +280,9 @@ function updateProgress() {
   const pos = playbackPosition();
   const duration = playbackDuration();
   const pct = duration > 0 ? Math.min(100, Math.max(0, (pos / duration) * 100)) : 0;
-  $('trackProgress').style.width = `${pct}%`;
-  $('trackTime').textContent = formatTime(pos);
-  $('trackDuration').textContent = formatTime(duration);
+  el.trackProgress.style.width = `${pct}%`;
+  el.trackTime.textContent = formatTime(pos);
+  el.trackDuration.textContent = formatTime(duration);
 }
 
 async function ensureAudio() {
@@ -265,87 +322,248 @@ async function resumePlayback() {
   updatePowerUi();
 }
 
+/**
+ * Pick the stem that typing reveals: the listener's remembered choice when this
+ * track can honour it, otherwise the first mode the stem set supports.
+ */
 function followStemMode(roles) {
-  return ['vocal', 'instrument', 'drums'].find((mode) => modeAvailable(mode, roles)) ?? 'vocal';
+  const modes = availableModes(roles);
+  if (!modes.length) return 'vocal';
+  return modes.includes(stemMode) ? stemMode : modes[0];
+}
+
+function applyStemMode(mode) {
+  stemMode = mode;
+  localStorage.setItem('cadence:stemMode', mode);
+  if (mixer) mixer.setMode(mode);
+  renderMixer();
+}
+
+const formatRoleList = (roles) => (roles.length < 2
+  ? (roles[0] ?? '')
+  : `${roles.slice(0, -1).join(', ')} and ${roles.at(-1)}`);
+
+/** Describe the mix in the listener's terms: what responds, and what always plays. */
+function stemModeHint(mode, roles) {
+  const foreground = MODES[mode]?.foreground.filter((r) => roles.includes(r)) ?? [];
+  const reveals = formatRoleList(foreground) || (MODES[mode]?.short ?? mode).toLowerCase();
+  const rest = roles.filter((r) => !foreground.includes(r));
+  if (!rest.length) return `Typing reveals ${reveals}.`;
+
+  // Name the anchor first: it is the part that never stops, whatever you type.
+  const ordered = rest.includes(ANCHOR_ROLE)
+    ? [ANCHOR_ROLE, ...rest.filter((r) => r !== ANCHOR_ROLE)]
+    : rest;
+  const listed = formatRoleList(ordered);
+  const sentence = `${listed[0].toUpperCase()}${listed.slice(1)}`;
+  return `Typing reveals ${reveals}. ${sentence} ${ordered.length === 1 ? 'keeps' : 'keep'} playing.`;
+}
+
+const ROLE_LABEL = {
+  vocals: 'Vocals', instrumental: 'Backing', drums: 'Drums', bass: 'Bass', other: 'Other',
+};
+
+/** Which mode, if any, reveals this role. */
+function modeForRole(role, roles) {
+  return availableModes(roles).find((mode) => MODES[mode].foreground.includes(role)) ?? null;
+}
+
+/** Meter elements, keyed by role, so the level loop never queries the DOM. */
+let meterEls = new Map();
+
+/**
+ * Rebuild the mixer for whatever the loaded track contains.
+ *
+ * Every stem gets a row, not just the selectable ones: showing the whole mix is
+ * what makes the mechanism legible. Rows that some mode can reveal are
+ * clickable; the rest are labelled as the bed they are.
+ */
+function renderMixer() {
+  const roles = currentEngine === 'stems' && deck ? deck.roles : [];
+  el.mixer.hidden = roles.length === 0;
+  // The spectrum belongs to the MIDI and audio engines. With nothing loaded it
+  // is a row of inert dashes, so it stays hidden until a track is actually on.
+  el.bars.hidden = roles.length > 0 || !currentEngine;
+  meterEls = new Map();
+  if (el.mixer.hidden) {
+    el.mixerRows.replaceChildren();
+    return;
+  }
+
+  const active = mixer?.mode ?? followStemMode(roles);
+  const fragment = document.createDocumentFragment();
+  for (const role of roles) {
+    const mode = modeForRole(role, roles);
+    const selected = mode !== null && mode === active;
+    const anchor = role === ANCHOR_ROLE;
+
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'stem-row';
+    row.dataset.role = role;
+    row.dataset.selectable = String(mode !== null);
+    row.dataset.anchor = String(anchor);
+    if (mode) {
+      row.dataset.mode = mode;
+      row.setAttribute('role', 'radio');
+      row.setAttribute('aria-checked', String(selected));
+      row.title = MODES[mode].hint;
+    } else {
+      row.disabled = true;
+      row.title = 'This stem plays continuously on this track.';
+    }
+
+    const name = document.createElement('span');
+    name.className = 'stem-name';
+    name.textContent = ROLE_LABEL[role] ?? role;
+
+    const meter = document.createElement('span');
+    meter.className = 'stem-meter';
+    const fill = document.createElement('i');
+    meter.appendChild(fill);
+    meterEls.set(role, fill);
+
+    const tag = document.createElement('span');
+    tag.className = 'stem-tag';
+    tag.textContent = selected ? 'Typing' : anchor ? 'Always' : 'Playing';
+
+    row.append(name, meter, tag);
+    fragment.appendChild(row);
+  }
+  el.mixerRows.replaceChildren(fragment);
+}
+
+/** Drive the meters from the gains the mixer actually applied. */
+function updateMeters() {
+  if (!deck || el.mixer.hidden) return;
+  for (const [role, fill] of meterEls) {
+    const gain = deck.stems.get(role)?.gain.gain.value ?? 0;
+    fill.style.transform = `scaleX(${Math.min(1, gain).toFixed(3)})`;
+  }
+}
+
+el.mixerRows.addEventListener('click', (event) => {
+  const mode = event.target?.closest?.('.stem-row')?.dataset.mode;
+  if (!mode || mode === mixer?.mode) return;
+  applyStemMode(mode);
+  el.npComposer.textContent = stemModeHint(mode, deck?.roles ?? []);
+});
+
+/**
+ * Measure the key of an audio file already in memory.
+ *
+ * The full-length PCM is released as soon as the band-limited analysis slice
+ * exists, so a long track does not leave a hundred megabytes of Float32
+ * resident while the FFT runs.
+ */
+async function analyzeKey(bytes) {
+  let buffer = await piano.ctx.decodeAudioData(bytes);
+  const samples = await toAnalysisSamples(buffer);
+  buffer = null;
+  return detectKeyAsync({ sampleRate: ANALYSIS_RATE, samples });
 }
 
 async function loadTrack(item, { autoplay = true } = {}) {
   if (!item || isLoading) return;
   current = item;
   setLoading(true);
-  $('npTitle').textContent = item.title;
-  $('npComposer').textContent = '准备中…';
-  $('sourceTag').textContent = '载入';
-  renderList();
+  el.npTitle.textContent = item.title;
+  el.npComposer.textContent = 'Preparing…';
+  setSourceTag('Loading');
+  updateListSelection();
 
   try {
     await ensureAudio();
     stopCurrent();
+    // Release whatever the previous engine was holding. Decoded stems alone can
+    // be well over 100 MB, and nothing frees them if the deck is only stopped.
+    if (deck && !item.stemUrls) { deck.unload(); mixer = null; }
+    if (backing && !item.audioUrl) backing.unload();
     current = item;
     loadedItemId = null;
     currentEngine = null;
     stemStartOffset = 0;
+    renderMixer();   // Hidden until we know the new track carries stems.
+
+    // Give the browser one frame to paint the loading state. Decoding a large
+    // MIDI blocks this thread inside @tonejs/midi, so without this yield the
+    // window freezes before the message the freeze is meant to explain appears.
+    if (item.get) {
+      el.npComposer.textContent = 'Reading score…';
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
     const piece = await library.load(item);
 
     if (item.stemUrls) {
       currentEngine = 'stems';
       deck = deck || new StemDeck(piano.ctx);
       touch = touch || new Touch(piano.ctx);
-      const buffers = {};
       const roles = Object.keys(item.stemUrls);
-      for (let i = 0; i < roles.length; i++) {
-        $('npComposer').textContent = `载入分轨 ${i + 1}/${roles.length}`;
-        const response = await fetch(item.stemUrls[roles[i]]);
-        if (!response.ok) throw new Error(`分轨载入失败：${response.status}`);
-        buffers[roles[i]] = await response.arrayBuffer();
-      }
+      // Fetch every stem at once; the decode inside deck.load() also overlaps.
+      let fetched = 0;
+      const buffers = Object.fromEntries(await Promise.all(roles.map(async (role) => {
+        const response = await fetch(item.stemUrls[role]);
+        if (!response.ok) throw new Error(`Stem loading failed: ${response.status}`);
+        const data = await response.arrayBuffer();
+        el.npComposer.textContent = `Loaded stem ${++fetched}/${roles.length}`;
+        return [role, data];
+      })));
       await deck.load(buffers, (progress) => {
-        $('npComposer').textContent = `解码 ${Math.round(progress * 100)}%`;
+        el.npComposer.textContent = `Decoding ${Math.round(progress * 100)}%`;
       });
       mixer = new Mixer(deck);
       mixer.setRefRate(refRate);
       mixer.setMode(followStemMode(deck.roles));
       deck.onEnded = () => handleTrackEnded();
       stemStartOffset = deck.audibleStart();
-      $('npComposer').textContent = '伴奏常驻 · 输入时人声显现';
-      $('sourceTag').textContent = '跟手分轨';
+      renderMixer();
+      el.npComposer.textContent = stemModeHint(mixer.mode, deck.roles);
+      setSourceTag('Typing stems');
       if (autoplay) deck.play(stemStartOffset);
     } else if (item.audioUrl) {
       currentEngine = 'audio';
       backing = backing || new Backing(piano.ctx);
       soloist = soloist || new Soloist(piano);
-      $('npComposer').textContent = '载入音频…';
-      await backing.load(item.audioUrl);
+      piano.ensureSampler();   // This engine performs on the piano, so pay for it now.
+      el.npComposer.textContent = 'Loading audio…';
+
       if (piece) {
+        await backing.load(item.audioUrl);
         soloist.fromMidi(piece);
         backing.offset = 0;
-        $('npComposer').textContent = '原曲伴奏 · 输入释放旋律';
+        el.npComposer.textContent = 'Original backing — Typing releases melody';
       } else {
-        $('npComposer').textContent = '识别调性…';
+        // No score to follow, so the key has to be measured. One read feeds both
+        // the player and the analyser instead of transferring the file twice.
         const response = await fetch(item.audioUrl);
-        const buffer = await piano.ctx.decodeAudioData(await response.arrayBuffer());
-        const key = detectKey(buffer);
+        if (!response.ok) throw new Error(`Audio reading failed: ${response.status}`);
+        const bytes = await response.arrayBuffer();
+        // Blob construction copies, so decoding may detach `bytes` afterwards.
+        await backing.load(URL.createObjectURL(new Blob([bytes])), { revokeOnUnload: true });
+        el.npComposer.textContent = 'Detecting key…';
+        const key = await analyzeKey(bytes);
         soloist.fromKey(key.tonic, key.mode);
-        $('npComposer').textContent = `${key.name} · 输入释放旋律`;
+        el.npComposer.textContent = `${key.name} — Typing releases melody`;
       }
       backing.onEnded = () => handleTrackEnded();
-      $('sourceTag').textContent = '音频';
+      setSourceTag('Audio');
       if (autoplay) await backing.play();
     } else {
-      if (!piece) throw new Error('曲目没有可播放内容');
+      if (!piece) throw new Error('This track has no playable content');
       currentEngine = 'midi';
       soloist = null;
+      piano.ensureSampler();
       player.mode = 'hybrid';
       player.load(piece);
-      $('npComposer').textContent = `${Math.round(piece.bpm)} BPM · 输入释放装饰音`;
-      $('sourceTag').textContent = 'MIDI';
+      el.npComposer.textContent = `${Math.round(piece.bpm)} BPM — Typing releases ornament notes`;
+      setSourceTag('MIDI');
       if (autoplay) player.start();
     }
 
     loadedItemId = item.id;
     isPlaying = autoplay;
-    $('trackDuration').textContent = formatTime(playbackDuration());
-    renderList();
+    el.trackDuration.textContent = formatTime(playbackDuration());
+    updateListSelection();
   } catch (error) {
     stopCurrent();
     reportError(error);
@@ -355,29 +573,41 @@ async function loadTrack(item, { autoplay = true } = {}) {
   }
 }
 
+/** Shuffle consumes a shuffled deck, so every track plays before any repeats. */
 function nextItem() {
   if (!queue.length) return null;
   if (!current) return queue[0];
   const index = Math.max(0, queue.findIndex((item) => item.id === current.id));
-  if (orderMode === 'shuffle' && queue.length > 1) {
-    let next = index;
-    while (next === index) next = Math.floor(Math.random() * queue.length);
-    return queue[next];
+  if (orderMode !== 'shuffle' || queue.length < 2) return queue[(index + 1) % queue.length];
+
+  const live = new Set(queue.map((item) => item.id));
+  shuffleDeck = shuffleDeck.filter((id) => live.has(id) && id !== current.id);
+  if (!shuffleDeck.length) {
+    shuffleDeck = queue.map((item) => item.id).filter((id) => id !== current.id);
+    for (let i = shuffleDeck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffleDeck[i], shuffleDeck[j]] = [shuffleDeck[j], shuffleDeck[i]];
+    }
   }
-  return queue[(index + 1) % queue.length];
+  const nextId = shuffleDeck.shift();
+  return queue.find((item) => item.id === nextId) ?? queue[(index + 1) % queue.length];
+}
+
+function showStandby(item) {
+  current = item;
+  loadedItemId = null;
+  el.npTitle.textContent = item.title;
+  el.npComposer.textContent = 'Enable to play';
+  setSourceTag('Standby');
+  updateListSelection();
 }
 
 async function nextTrack({ autoplay = isPlaying } = {}) {
   const item = nextItem();
   if (!item) return;
   if (!enabled) {
-    current = item;
-    loadedItemId = null;
-    $('npTitle').textContent = item.title;
-    $('npComposer').textContent = '启用后播放';
-    $('sourceTag').textContent = '待机';
+    showStandby(item);
     updateProgress();
-    renderList();
     return;
   }
   await loadTrack(item, { autoplay });
@@ -392,15 +622,16 @@ player.onPieceEnd = handleTrackEnded;
 
 async function setEnabled(next) {
   if (isLoading || next === enabled) return;
-  $('power').disabled = true;
+  el.power.disabled = true;
+  powerTransition = true;
   try {
     if (next) {
-      // 必须在按钮手势内先解锁 WebAudio，再等待任何 IPC。
+      // Unlock WebAudio inside the button gesture before awaiting any IPC call.
       await ensureAudio();
       if (desktop?.isDesktop) {
         const state = await desktop.setEnabled(true);
         if (!state?.supported || !state?.enabled) {
-          throw new Error(state?.error || 'Windows 全局键盘监听未能启动');
+          throw new Error(state?.error || 'Windows global keyboard monitoring could not start');
         }
       }
       enabled = true;
@@ -417,29 +648,38 @@ async function setEnabled(next) {
     pausePlayback();
     reportError(error);
   } finally {
-    $('power').disabled = false;
+    powerTransition = false;
+    el.power.disabled = false;
     updatePowerUi();
   }
 }
 
 function renderOrder() {
   const shuffle = orderMode === 'shuffle';
-  $('orderLabel').textContent = shuffle ? '随机' : '顺序';
-  $('order').querySelector('.order-icon').textContent = shuffle ? '⤨' : '⇥';
-  $('order').title = shuffle ? '随机播放' : '顺序播放';
-  $('order').setAttribute('aria-label', `当前为${shuffle ? '随机' : '顺序'}播放`);
+  el.orderLabel.textContent = shuffle ? 'Shuffle' : 'Sequence';
+  el.order.querySelector('.order-icon').textContent = shuffle ? '⤨' : '⇥';
+  el.order.title = shuffle ? 'Shuffle playback' : 'Sequence playback';
+  el.order.setAttribute('aria-label', shuffle ? 'Shuffle playback' : 'Sequence playback');
+}
+
+/** Selection changes far more often than the playlist does, so it moves alone. */
+function updateListSelection() {
+  for (const li of el.list.children) {
+    li.classList.toggle('on', li.dataset.id === current?.id);
+  }
 }
 
 function renderList() {
-  const list = $('list');
-  list.innerHTML = '';
-  $('emptyLibrary').hidden = queue.length > 0;
+  el.list.replaceChildren();
+  el.emptyLibrary.hidden = queue.length > 0;
+  const fragment = document.createDocumentFragment();
   queue.forEach((item, index) => {
     const li = document.createElement('li');
     li.className = item.id === current?.id ? 'on' : '';
+    li.dataset.id = item.id;
     li.tabIndex = 0;
     li.setAttribute('role', 'button');
-    li.setAttribute('aria-label', `播放 ${item.title}`);
+    li.setAttribute('aria-label', `Play ${item.title}`);
 
     const number = document.createElement('span');
     number.className = 'track-index';
@@ -449,42 +689,42 @@ function renderList() {
     const name = document.createElement('b');
     name.textContent = item.title;
     const source = document.createElement('small');
-    source.textContent = item.stemUrls ? '跟手分轨' : item.audioUrl ? '音频' : 'MIDI';
+    source.textContent = item.stemUrls ? 'Typing stems' : item.audioUrl ? 'Audio' : 'MIDI';
     copy.append(name, source);
     const state = document.createElement('span');
     state.className = 'list-state';
     li.append(number, copy, state);
-
-    const choose = () => {
-      if (isLoading) return;
-      if (!enabled) {
-        current = item;
-        loadedItemId = null;
-        $('npTitle').textContent = item.title;
-        $('npComposer').textContent = '启用后播放';
-        $('sourceTag').textContent = '待机';
-        renderList();
-      } else {
-        loadTrack(item, { autoplay: isPlaying }).catch(reportError);
-      }
-    };
-    li.addEventListener('click', choose);
-    li.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(); }
-    });
-    list.appendChild(li);
+    fragment.appendChild(li);
   });
+  el.list.appendChild(fragment);
 }
+
+function chooseFromList(target) {
+  const li = target?.closest?.('li');
+  if (!li || isLoading) return;
+  const item = queue.find((entry) => entry.id === li.dataset.id);
+  if (!item) return;
+  if (!enabled) showStandby(item);
+  else loadTrack(item, { autoplay: isPlaying }).catch(reportError);
+}
+
+// One delegated pair of listeners instead of two per track.
+el.list.addEventListener('click', (event) => chooseFromList(event.target));
+el.list.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  chooseFromList(event.target);
+});
 
 function reportError(error) {
   console.error(error);
-  $('npComposer').textContent = error?.message || '发生了未知错误';
-  $('sourceTag').textContent = '错误';
-  showToast(error?.message || '操作失败');
+  el.npComposer.textContent = error?.message || 'An unknown error occurred';
+  setSourceTag('Error');
+  showToast(error?.message || 'The operation failed');
 }
 
-$('power').addEventListener('click', () => setEnabled(!enabled));
-$('playPause').addEventListener('click', async () => {
+el.power.addEventListener('click', () => setEnabled(!enabled));
+el.playPause.addEventListener('click', async () => {
   if (isLoading) return;
   if (!enabled) {
     await setEnabled(true);
@@ -494,12 +734,13 @@ $('playPause').addEventListener('click', async () => {
     await resumePlayback();
   }
 });
-$('next').addEventListener('click', () => nextTrack({ autoplay: isPlaying }).catch(reportError));
-$('order').addEventListener('click', () => {
+el.next.addEventListener('click', () => nextTrack({ autoplay: isPlaying }).catch(reportError));
+el.order.addEventListener('click', () => {
   orderMode = orderMode === 'sequence' ? 'shuffle' : 'sequence';
+  shuffleDeck = [];
   localStorage.setItem('cadence:order', orderMode);
   renderOrder();
-  showToast(orderMode === 'shuffle' ? '已切换为随机播放' : '已切换为顺序播放');
+  showToast(orderMode === 'shuffle' ? 'Shuffle playback enabled' : 'Sequence playback enabled');
 });
 
 $('importHelpButton').addEventListener('click', () => {
@@ -530,8 +771,8 @@ $('pickDir').addEventListener('click', async () => {
   try {
     if (desktop?.openMusicResource) {
       const result = await desktop.openMusicResource();
-      if (!result?.ok) throw new Error(result?.error || '音乐资源文件夹无法打开');
-      showToast('音乐资源已打开 · 放入歌曲会自动刷新');
+      if (!result?.ok) throw new Error(result?.error || 'Music Resources could not be opened');
+      showToast('Music Resources opened — New songs refresh automatically');
       return;
     }
     if (!library.supportsFolder) {
@@ -541,8 +782,8 @@ $('pickDir').addEventListener('click', async () => {
     const result = library.needsPermission ? await library.regrant() : await library.pickFolder();
     if (!result) return;
     showToast(result.count
-      ? `已从 ${result.name} 加入 ${result.count} 首音乐`
-      : '文件夹里没有找到支持的音乐');
+      ? `Added ${result.count} track${result.count === 1 ? '' : 's'} from ${result.name}`
+      : 'No supported music was found in the folder');
   } catch (error) {
     if (error.name !== 'AbortError') reportError(error);
   }
@@ -550,55 +791,65 @@ $('pickDir').addEventListener('click', async () => {
 
 $('folderInput').addEventListener('change', async (event) => {
   const count = await library.addFiles(event.target.files);
-  showToast(count ? `已加入 ${count} 首音乐` : '没有找到支持的音乐文件');
+  showToast(count ? `Added ${count} track${count === 1 ? '' : 's'}` : 'No supported music files were found');
   event.target.value = '';
 });
 
 let dragDepth = 0;
 window.addEventListener('dragenter', (event) => {
   event.preventDefault();
-  if (++dragDepth === 1) $('dropzone').classList.add('on');
+  if (++dragDepth === 1) el.dropzone.classList.add('on');
 });
 window.addEventListener('dragleave', () => {
-  if (--dragDepth <= 0) { dragDepth = 0; $('dropzone').classList.remove('on'); }
+  if (--dragDepth <= 0) { dragDepth = 0; el.dropzone.classList.remove('on'); }
 });
 window.addEventListener('dragover', (event) => event.preventDefault());
 window.addEventListener('drop', async (event) => {
   event.preventDefault();
   dragDepth = 0;
-  $('dropzone').classList.remove('on');
+  el.dropzone.classList.remove('on');
   const count = await library.addFiles(event.dataTransfer.files);
-  showToast(count ? `已加入 ${count} 首音乐` : '没有找到支持的音乐文件');
+  showToast(count ? `Added ${count} track${count === 1 ? '' : 's'}` : 'No supported music files were found');
 });
 
-// 15Hz 音乐状态更新；进度和自动速度标定使用更低频率。
+// Update musical state at 15 Hz; progress and automatic speed calibration run
+// less often. The loop idles out once nothing is enabled, playing, or still
+// decaying, so a disabled window costs nothing.
 let lastTick = performance.now() / 1000;
 setInterval(() => {
   const now = performance.now() / 1000;
+  const features = sensor.features(now);
+
+  // Keep ticking briefly past the last key so gates and bars finish their decay.
+  if (!enabled && !isPlaying && features.idle > 5) {
+    lastTick = now;
+    return;
+  }
+
   const dt = now - lastTick;
   lastTick = now;
-  const features = sensor.features(now);
   arranger.update(features, dt);
 
   if (deck?.playing && mixer) {
     const mix = mixer.update(now, dt, features.rate);
-    foreground = mix.fg;
-    $('sourceTag').textContent = foreground > 0.04 ? '跟手中' : '伴奏';
+    setSourceTag(mix.fg > 0.04 ? 'Following' : 'Backing');
   } else if (isPlaying && currentEngine === 'midi') {
     player.syncTempo();
   }
 
   if (now - lastUiTick > 0.18) {
     lastUiTick = now;
-    $('stRate').textContent = features.rate.toFixed(1);
+    el.stRate.textContent = features.rate.toFixed(1);
     updateProgress();
-    scopeEls.forEach((el, index) => {
-      if (index < scopeEls.length - 1) {
-        const h = Number.parseFloat(el.style.height || '3');
-        el.style.height = `${Math.max(3, h * 0.82)}px`;
-        el.style.opacity = String(Math.max(0.16, Number(el.style.opacity || 0.2) * 0.9));
-      }
-    });
+    updateMeters();
+    const newest = (scopeCursor + scopeEls.length - 1) % scopeEls.length;
+    for (let i = 0; i < scopeEls.length; i++) {
+      if (i === newest) continue;
+      const bar = scopeEls[i];
+      const height = Number.parseFloat(bar.style.height || '3');
+      bar.style.height = `${Math.max(3, height * 0.82)}px`;
+      bar.style.opacity = String(Math.max(0.16, Number(bar.style.opacity || 0.2) * 0.9));
+    }
   }
 
   if (now - lastRateTune > 2) {
@@ -606,8 +857,11 @@ setInterval(() => {
     const typical = sensor.typicalRate();
     if (typical) {
       const target = Math.min(9, Math.max(1.2, typical));
-      refRate = refRate * 0.82 + target * 0.18;
-      localStorage.setItem('cadence:refRate', String(refRate));
+      const next = refRate * 0.82 + target * 0.18;
+      // The smoothing converges but never settles exactly, so persist only on a
+      // change actually worth a synchronous disk write.
+      if (Math.abs(next - refRate) > 0.05) localStorage.setItem('cadence:refRate', next.toFixed(2));
+      refRate = next;
       if (mixer) mixer.setRefRate(refRate);
     }
   }
@@ -617,6 +871,7 @@ library.onChange = () => {
   queue = library.items;
   if (current) current = queue.find((item) => item.id === current.id) || current;
   if (!current && queue.length) current = queue[0];
+  shuffleDeck = [];
   renderList();
 };
 
@@ -627,12 +882,13 @@ function applyMusicResource(payload, notify = false) {
     return 0;
   }
   const count = library.setResourceFiles(payload.files || []);
-  if (payload.error) showToast(`音乐资源读取失败：${payload.error}`);
-  else if (notify) showToast(`音乐资源已刷新 · ${count} 首`);
+  if (payload.error) showToast(`Music Resources could not be read: ${payload.error}`);
+  else if (notify) showToast(`Music Resources refreshed — ${count} track${count === 1 ? '' : 's'}`);
   return count;
 }
 
 renderOrder();
+renderMixer();   // Nothing is loaded yet, so this hides both the mixer and the spectrum.
 updatePowerUi();
 library.init().then(async () => {
   libraryReady = true;
@@ -643,20 +899,34 @@ library.init().then(async () => {
   }
   if (!queue.length) return;
   current = current || queue[0];
-  $('npTitle').textContent = current.title;
-  $('npComposer').textContent = '启用后播放';
-  $('sourceTag').textContent = '待机';
-  renderList();
+  el.npTitle.textContent = current.title;
+  el.npComposer.textContent = 'Enable to play';
+  setSourceTag('Standby');
+  updateListSelection();
 }).catch(reportError);
 
 if (desktop?.isDesktop) {
   desktop.onMusicResourceChange((payload) => applyMusicResource(payload, true));
   desktop.getState().then((state) => {
     if (!state?.supported) {
-      $('platformLabel').textContent = '全局监听不可用';
-      showToast(state?.error || 'Windows 全局键盘监听不可用');
+      el.platformLabel.textContent = 'Global monitoring unavailable';
+      showToast(state?.error || 'Windows global keyboard monitoring is unavailable');
     }
   }).catch(reportError);
+
+  // The main process broadcasts state on every change. Without this the UI keeps
+  // claiming input is enabled after a hook that failed once it was already
+  // running. Transitions we started ourselves are already reflected in the UI.
+  desktop.onState?.((state) => {
+    if (!state || powerTransition) return;
+    if (!state.supported) el.platformLabel.textContent = 'Global monitoring unavailable';
+    if (enabled && !state.enabled) {
+      enabled = false;
+      pausePlayback();
+      updatePowerUi();
+      showToast(state.error || 'Global keyboard monitoring stopped');
+    }
+  });
 }
 
 if (import.meta.env.DEV) {

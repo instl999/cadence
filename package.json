@@ -7,6 +7,7 @@
   "description": "Typing-driven classical piano. Your rhythm, Chopin's notes.",
   "scripts": {
     "midi": "node scripts/build-midi.mjs",
+    "test": "node --test tests/",
     "dev": "npm run midi && vite",
     "build": "npm run midi && vite build",
     "build:release": "node scripts/build-midi.mjs --no-local && vite build",
@@ -30,6 +31,9 @@
     "appId": "com.cadence.desktop",
     "productName": "Cadence",
     "electronDist": "node_modules/electron/dist",
+    "electronLanguages": [
+      "en-US"
+    ],
     "directories": {
       "output": "release"
     },
@@ -46,6 +50,13 @@
     "win": {
       "target": "portable",
       "artifactName": "Cadence-${version}-Windows.${ext}"
+    },
+    "nsis": {
+      "installerLanguages": [
+        "en_US"
+      ],
+      "multiLanguageInstaller": false,
+      "language": "1033"
     }
   }
 }

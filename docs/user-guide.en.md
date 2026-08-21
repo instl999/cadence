@@ -1,6 +1,6 @@
 # Cadence User Guide (English)
 
-[Home](../README.md) · [简体中文](user-guide.zh-CN.md) · [Development Guide](development.en.md)
+[Home](../README.md) | [Development Guide](development.en.md)
 
 ## 1. What Cadence Does
 
@@ -18,8 +18,8 @@ The desktop build targets Windows 11. Once enabled, typing in a browser, chat ap
 
 ## 3. Launch and Everyday Use
 
-1. Keep `Cadence-version-Windows.exe` and the `音乐资源` folder in the same directory.
-2. Run Cadence. If `音乐资源` is missing, the app creates it beside the executable with an example folder and instructions.
+1. Keep `Cadence-version-Windows.exe` and the `Music Resources` folder in the same directory.
+2. Run Cadence. If `Music Resources` is missing, the app creates it beside the executable with an example folder and instructions.
 3. Select a song in the playlist, or import your own music first.
 4. Select **Enable**. Large WAV files may take a few seconds to decode on first playback.
 5. Switch to any application and start typing. The input rhythm display indicates activity.
@@ -34,6 +34,7 @@ The desktop build targets Windows 11. Once enabled, typing in a browser, chat ap
 | Play / Pause | Controls the current song | Monitoring may remain enabled while paused |
 | Next | Selects the next song | Shuffle chooses another random song |
 | Sequence / Shuffle | Controls automatic track order | The choice is saved locally |
+| Stems mixer | Chooses which stem responds to typing | Gold row follows your typing; teal rows always play |
 | Playlist item | Selects a song immediately | If playback is active, the new song starts automatically |
 | Music Resource | Opens the fixed resource directory | The desktop app watches it for changes |
 | `?` | Shows the folder and UVR quick guide | Available by hover, keyboard focus, or click |
@@ -43,11 +44,11 @@ The desktop build targets Windows 11. Once enabled, typing in a browser, chat ap
 
 ### 4.1 Required Folder Layout
 
-The desktop app scans only the `音乐资源` folder beside the executable. Each song must have its own direct child folder. Do not place audio files directly in the resource root.
+The desktop app scans only the `Music Resources` folder beside the executable. Each song must have its own direct child folder. Do not place audio files directly in the resource root.
 
 ```text
 Cadence-0.1.0-Windows.exe
-音乐资源/
+Music Resources/
 ├─ Sample Song/
 │  ├─ Sample Song_(Vocals).wav
 │  └─ Sample Song_(Instrumental).wav
@@ -59,7 +60,7 @@ Cadence-0.1.0-Windows.exe
 Recommended workflow:
 
 1. Select **Music Resource** beside the playlist.
-2. Copy the `歌曲名示例` example folder.
+2. Copy the `Sample Song` example folder.
 3. Rename the copy to the song title.
 4. Put the audio or separated stems inside that folder.
 5. Return to Cadence. The playlist normally refreshes within about a second; there is no need to select the folder again.
@@ -76,7 +77,7 @@ WAV or a high-quality MP3 is recommended. Actual codec decoding depends on the m
 
 ### 4.3 Stem Pairing
 
-The full typing-follow effect needs at least one vocal stem and one instrumental stem. The most reliable names are:
+The typing-follow effect needs at least two stems: one for typing to reveal, and at least one to reveal it against. A UVR pair is the simplest form:
 
 ```text
 Song Name_(Vocals).wav
@@ -87,13 +88,23 @@ Matching is case-insensitive and recognizes common labels:
 
 | Role | Example labels |
 |---|---|
-| Vocal | `Vocals`, `Vocal`, `Vox`, `人声` |
-| Instrumental | `Instrumental`, `No Vocals`, `Accompaniment`, `Backing`, `伴奏` |
+| Vocal | `Vocals`, `Vocal`, `Vox` |
+| Instrumental | `Instrumental`, `No Vocals`, `Accompaniment`, `Backing` |
 | Extra stems | `Drums`, `Bass`, `Other`, `Piano`, `Guitar`, and Chinese equivalents |
 
-Demucs-style folders containing `vocals.wav`, `drums.wav`, `bass.wav`, and `other.wav` are also recognized. A single normal audio file can still be played, but it cannot provide the complete vocal/instrumental reveal effect. A folder with only one recognized stem also falls back to normal audio playback.
+Demucs-style folders containing `vocals.wav`, `drums.wav`, `bass.wav`, and `other.wav` are fully supported: all four stems load together and each one can be chosen as the stem that responds to typing. A single normal audio file can still be played, but it cannot provide the reveal effect. A folder with only one recognized stem also falls back to normal audio playback.
 
-### 4.4 Separating an MP3 with Ultimate Vocal Remover
+### 4.4 Choosing Which Stem Responds to Typing
+
+When a track carries stems, a **Stems** mixer appears in the player showing every stem the track has, each with a live level bar. Gold marks the stem that follows your typing; teal marks the stems that play regardless. Select any gold-capable row to change which stem responds.
+
+- The stem you select stays silent until you type, then rises with your rhythm and fades again when you stop.
+- Every other stem keeps playing on its own, ducking slightly while the selected stem is open so the overall level stays even.
+- **Bass always plays at a constant level**, whatever you type, so the track keeps its foundation. The only exception is when you choose Bass itself as the stem that responds.
+
+Your choice is remembered and reused on any track that has the same stem available. A vocal and instrumental pair shows both rows too, so you can always see which part is waiting on you and which is holding underneath.
+
+### 4.5 Separating an MP3 with Ultimate Vocal Remover
 
 Ultimate Vocal Remover (UVR) is an independent third-party open-source application and is not bundled with Cadence. Obtain it from the [official UVR website](https://ultimatevocalremover.com/) or the [official GitHub repository](https://github.com/Anjok07/ultimatevocalremovergui). Labels can vary between UVR versions; the following is a practical baseline for Cadence:
 
@@ -109,8 +120,8 @@ Ultimate Vocal Remover (UVR) is an independent third-party open-source applicati
 Example:
 
 ```text
-音乐资源/Sample Song/Sample Song_(Vocals).wav
-音乐资源/Sample Song/Sample Song_(Instrumental).wav
+Music Resources/Sample Song/Sample Song_(Vocals).wav
+Music Resources/Sample Song/Sample Song_(Instrumental).wav
 ```
 
 If UVR produces `Vocals` and `No Vocals`, those names may be kept; Cadence recognizes `No Vocals` as the instrumental. Do not trim only one stem. Both files must start at the same point and retain the same speed and duration to remain synchronized.
@@ -118,8 +129,9 @@ If UVR produces `Vocals` and `No Vocals`, those names may be kept; Cadence recog
 ## 5. How the Typing-Follow Effect Works
 
 - Every stem uses the same playback start and offset.
-- Keyboard activity changes a foreground gain gate; it does not restart vocal samples.
-- Continuous typing keeps the vocal present. Stopping produces a short natural fade instead of an abrupt cut.
+- Keyboard activity changes a foreground gain gate; it does not restart samples.
+- The stem selected in the **Stems** mixer is the one the gate controls. Every other stem plays continuously, and bass holds a steady level throughout.
+- Continuous typing keeps the selected stem present. Stopping produces a short natural fade instead of an abrupt cut.
 - Space and Enter are treated as structural boundaries and receive a slightly stronger tactile response.
 - A vocal stem may already be silent during an intro or instrumental break; typing cannot create vocals that are not present in that part of the source.
 
@@ -139,7 +151,7 @@ These rules need only timing and event category, not the text you type.
 
 - It does not reconstruct or save typed sentences.
 - It does not read password fields, the clipboard, or document contents.
-- It does not scan arbitrary disk locations outside `音乐资源`.
+- It does not scan arbitrary disk locations outside `Music Resources`.
 - It does not upload imported music.
 
 ### Network Behavior
@@ -169,7 +181,7 @@ A system-wide keyboard hook is a sensitive capability. Run only trusted builds a
 
 ### Files exist under Music Resource but do not appear
 
-- Confirm the layout is `音乐资源/song-name/file`, not files directly in the root.
+- Confirm the layout is `Music Resources/song-name/file`, not files directly in the root.
 - Confirm the extension is supported.
 - Make sure the file is no longer a partial download and copying has completed.
 - If two stems do not pair, use the recommended `(Vocals)` and `(Instrumental)` labels.
@@ -200,17 +212,17 @@ A system-wide keyboard hook is a sensitive capability. Run only trusted builds a
 ### Update
 
 1. Exit the old version.
-2. Back up `音乐资源`.
+2. Back up `Music Resources`.
 3. Replace the old `.exe` while keeping the resource folder beside it.
 4. Launch the new version and verify the playlist.
 
 ### Move to Another Computer or Directory
 
-Copy both the `.exe` and the complete `音乐资源` folder. Keep paired stems together and preserve their relative layout.
+Copy both the `.exe` and the complete `Music Resources` folder. Keep paired stems together and preserve their relative layout.
 
 ### Remove
 
-Cadence is portable. Exit it and delete the `.exe`; delete `音乐资源` separately only if you no longer need the music. A few interface preferences, such as playback order, are stored by Electron/Chromium in the current Windows user's application-data directory and are not removed automatically with the portable file.
+Cadence is portable. Exit it and delete the `.exe`; delete `Music Resources` separately only if you no longer need the music. A few interface preferences, such as playback order, are stored by Electron/Chromium in the current Windows user's application-data directory and are not removed automatically with the portable file.
 
 ## 9. Music Rights
 

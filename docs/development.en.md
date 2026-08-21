@@ -1,6 +1,6 @@
 # Cadence Development and Release Guide (English)
 
-[Home](../README.md) · [简体中文](development.zh-CN.md) · [User Guide](user-guide.en.md)
+[Home](../README.md) | [User Guide](user-guide.en.md)
 
 ## 1. Stack and Environment
 
@@ -46,8 +46,10 @@ src/
   styles.css          UI styling
   library/library.js  Local grouping, stem recognition, and cache
   engine/             Playback, gating, analysis, and typing rhythm
-音乐资源/
-  歌曲名示例/         User example copied beside release builds
+  shared/             Rules used by both the renderer and the build scripts
+tests/                Unit tests for the pure logic, run by the Node test runner
+Music Resources/
+  Sample Song/        User example copied beside release builds
 public/midi/           Maintained or generated built-in resources
 docs/                  Chinese and English documentation
 ```
@@ -58,9 +60,12 @@ Do not commit these directories:
 node_modules/ dist/ release/
 local-midi/ local-audio/ local-stems/
 public/midi/local/ public/midi/audio/ public/midi/stems/
+public/midi/manifest.json
 ```
 
-They can contain large generated artifacts or copyrighted user music. Everything under `音乐资源` except `歌曲名示例` is ignored as well. Still inspect `git status` and the staged diff before every publication.
+They can contain large generated artifacts or copyrighted user music. Everything under `Music Resources` except `Sample Song` is ignored as well. Still inspect `git status` and the staged diff before every publication.
+
+`public/midi/manifest.json` is generated, not authored. `build-midi.mjs` rewrites it on every `npm run dev`, `npm run build`, and `npm run build:release`, and it names whatever currently sits in `local-midi/`, `local-audio/`, and `local-stems/` — so tracking it would put private song titles into source control even though the media itself is ignored. Every command that runs the app regenerates it first, so nothing depends on a committed copy.
 
 ## 4. Runtime Architecture
 
@@ -71,7 +76,7 @@ They can contain large generated artifacts or copyrighted user music. Everything
 - The single-instance lock and window lifecycle.
 - Loading `uiohook-napi` and starting the global hook only after explicit user enablement.
 - Classifying raw key codes as `char`, `back`, `enter`, or `space`.
-- Ensuring that `音乐资源` exists beside the executable.
+- Ensuring that `Music Resources` exists beside the executable.
 - Scanning the fixed “one song folder, then files” layout.
 - Watching changes with `fs.watch` and a debounce.
 - Registering opaque, hashed `cadence-media://` URLs so absolute paths are not exposed to the renderer.
@@ -83,9 +88,9 @@ They can contain large generated artifacts or copyrighted user music. Everything
 
 ### Renderer and Library
 
-`src/main.js` owns enablement and loading state, transport controls, sequence/shuffle, playlist behavior, drag-and-drop, and UI updates. Desktop input arrives through preload; the browser preview uses only page-local `keydown` events.
+`src/main.js` owns enablement and loading state, transport controls, sequence/shuffle, playlist behavior, drag-and-drop, and UI updates. The stem mixer is rendered by `renderMixer()` and metered by `updateMeters()`, which reads the gains the `Mixer` actually applied rather than recomputing them. Desktop input arrives through preload; the browser preview uses only page-local `keydown` events.
 
-`src/library/library.js` normalizes built-in MIDI, normal audio, selected browser folders, dropped files, and desktop resources into playable entries. Stems are grouped by directory and cleaned title, with a `vocals + instrumental` pair preferred for the typing-follow entry.
+`src/library/library.js` normalizes built-in MIDI, normal audio, selected browser folders, dropped files, and desktop resources into playable entries. Stems are grouped by directory and cleaned title. Any set the mixer can drive becomes a typing entry, from a two-stem UVR pair to a four-stem Demucs split; a set with nothing to reveal against falls back to normal audio.
 
 ## 5. Keyboard Privacy Data Flow
 
@@ -111,31 +116,49 @@ Any feature that changes this boundary is a security- and privacy-sensitive chan
 
 ### Root Resolution
 
-- Development: `音乐资源` under the project root.
-- Windows portable build: `PORTABLE_EXECUTABLE_DIR/音乐资源`.
-- Other packaged layouts: `音乐资源` beside `process.execPath`.
+- Development: `Music Resources` under the project root.
+- Windows portable build: `PORTABLE_EXECUTABLE_DIR/Music Resources`.
+- Other packaged layouts: `Music Resources` beside `process.execPath`.
 - Tests may isolate the root with `CADENCE_MUSIC_ROOT`.
 
 ### Scan and Security Rules
 
-- Only direct child directories of `音乐资源` are scanned; each is one song container.
+- Only direct child directories of `Music Resources` are scanned; each is one song container.
 - Only allow-listed extensions are read.
 - Absolute file paths are never returned over IPC. The main process creates hashed tokens and `cadence-media://file/<token>` URLs.
 - The protocol handler revalidates that every resolved file remains under the music root.
 
 ### Stem Recognition
 
-`library.js` strips extensions, normalizes titles, and detects role labels. A Vocal + Instrumental pair becomes a full stem entry; an incomplete set falls back to normal audio. When adding labels, test both parenthesized UVR names and role-only Demucs names, and avoid classifying `instrumental` through an embedded `vocal` substring.
+`library.js` strips extensions, normalizes titles, and detects role labels. A Vocal + Instrumental pair becomes a full stem entry; an incomplete set falls back to normal audio.
+
+All role rules live in one table, `src/shared/stem-roles.js`, which both the renderer and `scripts/build-midi.mjs` import. Add labels there and nowhere else.
+
+Two properties of that table are load-bearing:
+
+- **Row order.** The instrumental patterns are tested before the vocal patterns because `no_vocals` contains `vocals`. Reversing them files a Demucs instrumental as the vocal stem and silently drops the real vocals.
+- **The `titleProne` column.** Words that also appear in ordinary song titles — `piano`, `guitar`, `backing` — are matched only inside a parenthesized UVR marker, never against a bare filename, so `Piano Man.mp3` stays a song rather than becoming an `other` stem. Separator tools write canonical bare names, so nothing real is missed.
+
+`tests/stem-roles.test.js` and `tests/library.test.js` lock both properties down. Run `npm test` after any edit to the table.
 
 ## 7. Playback Model
 
 The core model is synchronized stems plus an input-controlled gain gate—not one sample start per key:
 
 ```text
-final output = background stem × background coefficient
+final output = background stems × background coefficient
              + foreground stem × typing activity
+             + anchor stem × constant level
              + subtle per-key tactile transient
 ```
+
+### Choosing the Foreground Stem
+
+A mode in `gate.js` names only the stems that typing reveals. Everything else the track carries becomes background automatically, so a two-stem UVR pair and a four-stem Demucs split both work without enumerating combinations.
+
+`availableModes(roles)` returns every mode a stem set supports, and drives two things: whether `library.js` treats the set as a typing entry at all, and which buttons the picker shows. A set that supports no mode—a lone stem with nothing to reveal against—falls back to normal audio. The listener's choice is stored in `cadence:stemMode` and reused on any track that can honour it.
+
+`ANCHOR_ROLE` is the stem that holds a constant level regardless of typing, so the track always keeps a foundation. It defaults to `bass` and is exempt from the background duck. It is gated only when it is itself the stem the listener chose to reveal.
 
 All stems share an AudioContext timeline, start time, and offset. Key events update the activity model and tactile layer; stem gains move smoothly. This prevents fast typing from turning vocals into repeated fragments.
 
@@ -154,11 +177,26 @@ Primary output:
 ```text
 release/
   Cadence-<version>-Windows.exe
-  音乐资源/
-    歌曲名示例/
+  Music Resources/
+    Sample Song/
 ```
 
-The release build first runs `scripts/build-midi.mjs --no-local`, which removes only generated local-media copies under `public/midi` and never touches the original `local-*` files. `scripts/prepare-release.mjs` then copies the resource example and bilingual documentation. Its merge copy does not delete songs already present in the release directory, so use a clean `release/` before a public build to avoid shipping stale test music.
+The release build first runs `scripts/build-midi.mjs --no-local`, which removes only generated local-media copies under `public/midi` and never touches the original `local-*` files. `scripts/prepare-release.mjs` then copies documentation and the example music resource.
+
+That copy is restricted to the folders named in `RELEASE_SONG_FOLDERS` — currently just `Sample Song`, mirroring the `.gitignore` allow-list. Copying all of `Music Resources` would put whatever the developer has been testing with into the public package, which is exactly what the README promises does not happen. Every other song folder is reported and skipped:
+
+```text
+  [music-resource] excluded 1 local song folder(s): My Test Song
+```
+
+The script does not delete anything already sitting in `release/`, because that directory is build output rather than something it owns. It does warn when it finds song folders there that it did not put there:
+
+```text
+  [music-resource] WARNING: release\win-unpacked\Music Resources still contains My Test Song.
+  [music-resource] Delete release/ and package again before publishing.
+```
+
+Treat that warning as blocking. Delete `release/` and package again rather than publishing the artifact.
 
 The executable is currently unsigned. Before a public release:
 
@@ -173,12 +211,17 @@ The executable is currently unsigned. Before a public release:
 ### Static and Build Checks
 
 ```powershell
+npm test
 node --check electron/main.cjs
 node --check electron/preload.cjs
-node --check src/main.js
-node --check src/library/library.js
 npm run build
 ```
+
+`npm test` runs the Node test runner over `tests/`, with no extra dependency to
+install. It covers the pure logic where mistakes are quiet rather than loud:
+stem-role recognition, playlist grouping, MIDI salience ranking, key detection,
+the typing feature window, and the gain gate. Run it before every release and
+after any change to `src/shared/stem-roles.js`.
 
 ### Desktop Smoke Test
 
@@ -194,7 +237,7 @@ npm run build
 ### Security Regression
 
 - IPC still carries only an allow-listed `kind`.
-- The custom media protocol cannot read outside `音乐资源`.
+- The custom media protocol cannot read outside `Music Resources`.
 - External navigation and new windows remain blocked.
 - The renderer retains `nodeIntegration: false`, `contextIsolation: true`, and `sandbox: true`.
 

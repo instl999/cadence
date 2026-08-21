@@ -1,13 +1,12 @@
 /**
- * 第一层反馈：每次击键的即时触感。
+ * First feedback layer: an immediate tactile response for every key press.
  *
- * 20~60ms 的极轻瞬态，音量很低（默认 −26dB 左右）。
- * 它的职责不是「音乐」，而是保证每一次击键都有确认感——
- * 第二层（声部门控）是按窗口合并的，单次击键不一定引起可闻变化，
- * 没有这一层的话慢速打字会觉得「我按了但没反应」。
+ * A quiet 20-60 ms transient confirms each key press. The second feedback layer
+ * aggregates stem gating over a window, so one key may not cause an audible
+ * change; this layer keeps slow typing responsive.
  *
- * 用合成瞬态而不是原曲采样：不依赖素材、延迟可控、
- * 而且音色可以刻意做得中性，不和任何调性打架。
+ * A synthesized transient avoids media dependencies, keeps latency predictable,
+ * and stays harmonically neutral.
  */
 export class Touch {
   constructor(ctx) {
@@ -27,11 +26,11 @@ export class Touch {
     return buf;
   }
 
-  /** @param accent true 时给一个更明显的（空格/回车） */
+  /** @param accent Use a stronger response for Space or Enter. */
   hit(accent = false) {
     const ctx = this.ctx;
-    const t = ctx.currentTime + 0.002;   // 直接用原生时钟，不经 Tone 的 lookAhead
-    if (t - this._last < 0.02) return;   // 极限连打时限流，避免叠成噪音
+    const t = ctx.currentTime + 0.002;   // Use the native clock without look-ahead.
+    if (t - this._last < 0.02) return;   // Rate-limit extreme bursts.
     this._last = t;
 
     const dur = accent ? 0.055 : 0.03;
@@ -51,6 +50,4 @@ export class Touch {
     src.connect(bp); bp.connect(g); g.connect(this.out);
     src.start(t); src.stop(t + dur + 0.02);
   }
-
-  setLevel(v) { this.out.gain.setTargetAtTime(v, this.ctx.currentTime, 0.05); }
 }

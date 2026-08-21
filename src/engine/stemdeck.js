@@ -1,12 +1,11 @@
 /**
- * 分轨调音台：所有声部共用一条播放时间轴，各自一个音量门。
+ * Stem mixer: every stem shares one timeline and has its own gain gate.
  *
- * 关键点是**绝不为击键重新启动采样**。所有轨用同一个 ctx.currentTime 起播、
- * 同一个 offset，之后永远样本级同步。击键只改增益。
+ * A key press never restarts a sample. Every stem starts at the same context
+ * time and offset, stays sample-aligned, and responds only through gain changes.
  *
- * 这样用户听到的永远是原曲在那一刻本来的样子：
- * 不会跑调、不会对不上、不会口吃成「我…我…我…」。
- * 间奏段也自动正确——那里人声轨本来就是空的，开门也不会有声音。
+ * This preserves the song's original timing and pitch. Instrumental sections
+ * also behave naturally because a silent vocal stem remains silent when opened.
  */
 export class StemDeck {
   constructor(ctx) {
@@ -18,61 +17,79 @@ export class StemDeck {
     this.playing = false;
     this._startCtx = 0;
     this._startOffset = 0;
-    this._endTimer = null;
+    this._generation = 0;
     this.onEnded = () => {};
   }
 
   /** @param entries {role: ArrayBuffer} */
   async load(entries, onProgress = () => {}) {
     this.stop();
-    this.stems.clear();
-    this.duration = 0;
     const roles = Object.keys(entries);
     let done = 0;
-    for (const role of roles) {
+    // Decode every stem at once. decodeAudioData runs off the main thread, so
+    // these genuinely overlap; serialising them multiplied load time by the
+    // number of stems.
+    const decoded = await Promise.all(roles.map(async (role) => {
       const buffer = await this.ctx.decodeAudioData(entries[role]);
+      onProgress(++done / roles.length, role);
+      return [role, buffer];
+    }));
+
+    // Swap in only once every stem decoded, so a mid-load failure cannot leave
+    // the deck holding a partial mix.
+    for (const s of this.stems.values()) s.gain.disconnect();
+    this.stems.clear();
+    this.duration = 0;
+    for (const [role, buffer] of decoded) {
       const gain = this.ctx.createGain();
       gain.gain.value = 0;
       gain.connect(this.master);
       this.stems.set(role, { buffer, gain, src: null });
       this.duration = Math.max(this.duration, buffer.duration);
-      onProgress(++done / roles.length, role);
     }
     return this;
+  }
+
+  /** Drop decoded audio; a stereo pair can hold well over 100 MB. */
+  unload() {
+    this.stop();
+    for (const s of this.stems.values()) s.gain.disconnect();
+    this.stems.clear();
+    this.duration = 0;
   }
 
   has(role) { return this.stems.has(role); }
   get roles() { return [...this.stems.keys()]; }
 
-  /** 所有轨用同一个起播时刻和同一个 offset —— 这是同步的全部秘密 */
+  /** Start every stem at the same time and offset to keep them synchronized. */
   play(offset = this._startOffset) {
     if (this.playing) this._stopSources();
     const safeOffset = Math.max(0, Math.min(offset, Math.max(0, this.duration - 0.01)));
     const t = this.ctx.currentTime + 0.06;
+    const generation = ++this._generation;
+    let longest = null;
     for (const s of this.stems.values()) {
       const src = this.ctx.createBufferSource();
       src.buffer = s.buffer;
       src.connect(s.gain);
       src.start(t, Math.min(safeOffset, s.buffer.duration - 0.01));
       s.src = src;
+      if (!longest || s.buffer.duration > longest.buffer.duration) longest = s;
     }
     this._startCtx = t;
     this._startOffset = safeOffset;
     this.playing = true;
-    clearTimeout(this._endTimer);
-    this._endTimer = setTimeout(() => {
-      if (!this.playing) return;
-      this.playing = false;
-      this._startOffset = this.duration;
-      this.onEnded();
-    }, Math.max(0, this.duration - safeOffset) * 1000 + 80);
-  }
 
-  seek(sec) {
-    const wasPlaying = this.playing;
-    this._stopSources();
-    this._startOffset = Math.max(0, Math.min(sec, Math.max(0, this.duration - 0.01)));
-    if (wasPlaying) this.play(Math.max(0, Math.min(sec, this.duration - 0.5)));
+    // End on the AudioContext clock rather than a wall-clock timer. The two
+    // diverge across system sleep, and only the audio clock knows the truth.
+    if (longest?.src) {
+      longest.src.onended = () => {
+        if (generation !== this._generation || !this.playing) return;
+        this.playing = false;
+        this._startOffset = this.duration;
+        this.onEnded();
+      };
+    }
   }
 
   pause() {
@@ -87,16 +104,20 @@ export class StemDeck {
     this._stopSources();
     this.playing = false;
     this._startOffset = 0;
-    // 增益一并归零：源已经停了不会出声，但留着非零值会让下一次起播
-    // 在门控还没跑起来的那一瞬间漏出全音量
+    // Reset gains so the next start cannot leak full volume before gating begins.
     for (const s of this.stems.values()) s.gain.gain.value = 0;
   }
 
   _stopSources() {
-    clearTimeout(this._endTimer);
-    this._endTimer = null;
+    // Bumping the generation first makes the ended handlers of these sources
+    // no-ops, so a deliberate stop cannot be mistaken for the end of the track.
+    this._generation++;
     for (const s of this.stems.values()) {
-      if (s.src) { try { s.src.stop(); } catch { /* 已结束 */ } s.src.disconnect(); s.src = null; }
+      if (!s.src) continue;
+      s.src.onended = null;
+      try { s.src.stop(); } catch { /* Already ended. */ }
+      s.src.disconnect();
+      s.src = null;
     }
   }
 
@@ -105,7 +126,7 @@ export class StemDeck {
     return this._startOffset + (this.ctx.currentTime - this._startCtx);
   }
 
-  /** 找到背景声部真正开始有声的位置，跳过分轨工具留下的长前导静音。 */
+  /** Find the first audible background frame and skip long separator silence. */
   audibleStart(preferred = ['instrumental', 'other', 'drums', 'bass']) {
     const role = preferred.find((r) => this.stems.has(r)) ?? this.roles[0];
     const buffer = this.stems.get(role)?.buffer;
@@ -113,7 +134,7 @@ export class StemDeck {
 
     const frame = Math.max(512, Math.floor(buffer.sampleRate * 0.05));
     const limit = Math.min(buffer.length, Math.floor(buffer.sampleRate * 24));
-    const threshold = 0.0028; // 约 -51dB RMS
+    const threshold = 0.0028; // Approximately -51 dB RMS.
     let consecutive = 0;
 
     for (let start = 0; start < limit; start += frame) {
@@ -134,21 +155,11 @@ export class StemDeck {
     return 0;
   }
 
-  /** 平滑设置某个声部的增益。ramp 秒数决定淡入淡出速度。 */
+  /** Smoothly set a stem gain; ramp controls the fade duration in seconds. */
   setGain(role, value, ramp = 0.05) {
     const s = this.stems.get(role);
     if (!s) return;
     s.gain.gain.setTargetAtTime(Math.max(0, value), this.ctx.currentTime, Math.max(0.005, ramp / 3));
   }
 
-  setMaster(v) { this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.05); }
-
-  /** 估算内存占用（MB），用来判断要不要降规格 */
-  get memoryMB() {
-    let bytes = 0;
-    for (const s of this.stems.values()) {
-      bytes += s.buffer.length * s.buffer.numberOfChannels * 4;
-    }
-    return +(bytes / 1048576).toFixed(0);
-  }
 }
